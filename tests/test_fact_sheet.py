@@ -80,7 +80,8 @@ def test_growth_is_stated_as_percent_and_as_multiple_and_the_comparison_is_compu
     multiple = next(f for label, f in facts.items() if label.startswith("Revenue year over year as a multiple"))
     assert multiple["value"] == pytest.approx(4.716, abs=0.001)
     assert facts["Accounts receivable growth year over year (percent)"]["value"] == pytest.approx(340.8, abs=0.1)
-    assert "SLOWER" in facts["Receivables vs revenue, year over year"]["value"]
+    assert facts["Receivables vs revenue, year over year"]["value"] == (
+        "receivables grew SLOWER than revenue: days sales outstanding fell from 51 to 48 days")
     assert facts["Days sales outstanding, latest quarter"]["value"] == pytest.approx(47.8, abs=0.1)
     assert facts["Insider open-market purchases, last 90 days (value)"]["value"] == 0
     assert facts["Insider sales by CEO PERSON (Chief Executive Officer)"]["value"] == pytest.approx(53_272_704)
@@ -303,3 +304,20 @@ def test_a_proposal_referred_back_to_is_still_a_proposal(vendor):
 
     assert got["unsupported"] == []
     assert len(got["proposal"]) == 4
+
+
+@pytest.mark.unit
+def test_receivables_off_a_tiny_base_get_no_growth_rate_and_no_comparison(vendor, monkeypatch):
+    # IREN: receivables $1.6M -> $21.1M read as +1,247% "faster than revenue"
+    # while days sales outstanding showed collections were normal.
+    class Tiny(_Ticker):
+        quarterly_balance_sheet = _frame({"Accounts Receivable": [21.1e6, 69.1e6, 9.6e6, 24.1e6, 1.6e6]})
+
+    monkeypatch.setattr(yahoo_facts.yf, "Ticker", lambda s: Tiny())
+    sheet = yahoo_facts.build_fact_sheet("IREN", "2026-09-24")
+    labels = {f["label"] for f in sheet["facts"]}
+
+    assert "Accounts receivable growth year over year (percent)" not in labels
+    assert "Receivables vs revenue, year over year" not in labels
+    assert "Days sales outstanding, latest quarter" in labels
+    assert any(g.startswith("accounts receivable growth rate") for g in sheet["gaps"])

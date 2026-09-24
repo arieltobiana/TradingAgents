@@ -39,6 +39,7 @@ QUARTER_LAG_DAYS = 45
 FISCAL_YEAR_END_LAG_DAYS = 90
 NON_US_LAG_DAYS = 120
 INSIDER_WINDOW_DAYS = 90
+MIN_RECEIVABLES_BASE_DAYS = 5
 _YEAR_AGO_TOLERANCE_DAYS = 20
 _QUARTER_GAP_DAYS = (70, 110)
 
@@ -213,7 +214,7 @@ def _dated(s: pd.Series, anchor, days: int, tolerance: int):
     return None
 
 
-def _growth(sheet: _Sheet, name: str, s: pd.Series, src: str) -> dict:
+def _growth(sheet: _Sheet, name: str, s: pd.Series, src: str, yoy_rate: bool = True) -> dict:
     """Latest, quarter-on-quarter and year-on-year for one quarterly series."""
     out: dict = {}
     latest_d, latest = s.index[0], float(s.iloc[0])
@@ -227,7 +228,7 @@ def _growth(sheet: _Sheet, name: str, s: pd.Series, src: str) -> dict:
     if yago is not None:
         base = float(s[yago])
         sheet.add(f"{name}, same quarter a year earlier ({pd.Timestamp(yago):%Y-%m-%d})", base, "money", src)
-        if base > 0 and latest >= 0:
+        if yoy_rate and base > 0 and latest >= 0:
             g = (latest / base - 1) * 100
             out["yoy_pct"] = g
             sheet.add(f"{name} growth year over year (percent)", g, "pct", src)
@@ -260,7 +261,8 @@ def _fundamental_facts(sheet: _Sheet, symbol: str, trade_date: str) -> None:
     src = "quarterly statements, dated by period end, as currently reported (may include restatements)"
 
     rev = _row(inc, "Total Revenue", "Operating Revenue")
-    rev_g = _growth(sheet, "Revenue", rev, src) if rev is not None else {}
+    if rev is not None:
+        _growth(sheet, "Revenue", rev, src)
     ni = _row(inc, "Net Income", "Net Income Common Stockholders")
     if ni is not None:
         _growth(sheet, "Net income", ni, src)
@@ -276,22 +278,35 @@ def _fundamental_facts(sheet: _Sheet, symbol: str, trade_date: str) -> None:
     if not bal.empty:
         ar = _row(bal, "Accounts Receivable", "Receivables")
         if ar is not None:
-            ar_g = _growth(sheet, "Accounts receivable", ar, src)
-            if "yoy_pct" in ar_g and "yoy_pct" in rev_g:
-                faster = "FASTER" if ar_g["yoy_pct"] > rev_g["yoy_pct"] else "SLOWER"
-                sheet.add("Receivables vs revenue, year over year",
-                          f"receivables grew {faster} than revenue "
-                          f"({ar_g['yoy_pct']:+.1f}% vs {rev_g['yoy_pct']:+.1f}%)", "text", src)
-            if rev is not None:
-                # Days sales outstanding on a 91-day quarter.
-                dso = (ar / rev.reindex(ar.index) * 91).dropna()
-                if not dso.empty:
-                    top = dso.index[0]
-                    sheet.add("Days sales outstanding, latest quarter", float(dso.iloc[0]), "days", src)
-                    for label, days in (("prior quarter", 91), ("year-ago quarter", 365)):
-                        d = _dated(dso, top, days, _YEAR_AGO_TOLERANCE_DAYS)
-                        if d is not None:
-                            sheet.add(f"Days sales outstanding, {label}", float(dso[d]), "days", src)
+            # Receivables are judged against revenue through days sales
+            # outstanding (91-day quarter), not by comparing two growth rates:
+            # a growth rate off a tiny base (IREN: $1.6M to $21.1M, +1,247%)
+            # reads as alarming while collections actually sped up.
+            dso = (ar / rev.reindex(ar.index) * 91).dropna() if rev is not None else pd.Series(dtype=float)
+            yago_dso = None
+            if not dso.empty:
+                top = dso.index[0]
+                d = _dated(dso, top, 365, _YEAR_AGO_TOLERANCE_DAYS)
+                yago_dso = float(dso[d]) if d is not None else None
+            tiny_base = yago_dso is not None and yago_dso < MIN_RECEIVABLES_BASE_DAYS
+            _growth(sheet, "Accounts receivable", ar, src, yoy_rate=not tiny_base)
+            if tiny_base:
+                sheet.gaps.append(
+                    f"accounts receivable growth rate (year-ago base was {yago_dso:.1f} days of sales, "
+                    "too small for a rate to mean anything; use days sales outstanding)")
+            if not dso.empty:
+                sheet.add("Days sales outstanding, latest quarter", float(dso.iloc[0]), "days", src)
+                prior = _dated(dso, top, 91, _YEAR_AGO_TOLERANCE_DAYS)
+                if prior is not None:
+                    sheet.add("Days sales outstanding, prior quarter", float(dso[prior]), "days", src)
+                if yago_dso is not None:
+                    sheet.add("Days sales outstanding, year-ago quarter", yago_dso, "days", src)
+                if yago_dso is not None and not tiny_base:
+                    now = float(dso.iloc[0])
+                    faster, moved = ("FASTER", "rose") if now > yago_dso else ("SLOWER", "fell")
+                    sheet.add("Receivables vs revenue, year over year",
+                              f"receivables grew {faster} than revenue: days sales outstanding {moved} "
+                              f"from {yago_dso:.0f} to {now:.0f} days", "text", src)
         for label, names in (("Cash and equivalents", ("Cash And Cash Equivalents",)),
                              ("Total debt", ("Total Debt",)),
                              ("Inventory", ("Inventory",))):
@@ -302,7 +317,11 @@ def _fundamental_facts(sheet: _Sheet, symbol: str, trade_date: str) -> None:
     if not cf.empty:
         fcf = _row(cf, "Free Cash Flow")
         if fcf is not None:
-            sheet.add("Free cash flow, latest quarter", float(fcf.iloc[0]), "money", src)
+            # Operating cash flow minus what this vendor classes as capital
+            # spending, which can be broader than the filing's PP&E line
+            # (IREN FY2026: $4.45B here, $3.0B in the 10-K).
+            sheet.add("Free cash flow, latest quarter (vendor's definition of capital spending; "
+                      "may differ from the filing)", float(fcf.iloc[0]), "money", src)
 
 
 class _AllQuarters(set):

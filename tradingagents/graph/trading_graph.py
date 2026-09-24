@@ -152,6 +152,7 @@ class TradingAgentsGraph:
             f"debate={self.config['max_debate_rounds']}",
             f"risk={self.config['max_risk_discuss_rounds']}",
             f"asset={asset_type}",
+            f"fact_check={bool(self.config.get('fact_check_enabled', True))}",
             # None, an empty book and a changed book are three different runs.
             f"portfolio={portfolio.fingerprint() if portfolio is not None else 'none'}",
         ])
@@ -282,7 +283,9 @@ class TradingAgentsGraph:
 
     def _fact_sheet(self, company_name, trade_date, asset_type) -> dict:
         """The run's code-computed facts, or {} when disabled (never raises)."""
-        if not self.config.get("fact_check_enabled", True):
+        # A resumed run takes its state from the checkpoint; building a new
+        # sheet would cost network calls for a value that is then discarded.
+        if not self.config.get("fact_check_enabled", True) or getattr(self, "_resuming", False):
             return {}
         with run_config(self.config):
             return build_fact_sheet(company_name, str(trade_date), asset_type)

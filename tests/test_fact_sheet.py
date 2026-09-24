@@ -11,7 +11,13 @@ import pandas as pd
 import pytest
 
 from tradingagents.agents import facts as agent_facts
-from tradingagents.agents.facts import check_decision, render_fact_sheet, unverified_claims
+from tradingagents.agents.facts import (
+    check_decision,
+    classify_claims,
+    render_fact_sheet,
+    unverified_claims,
+)
+from tradingagents.agents.rating import parse_rating
 from tradingagents.dataflows.vendors.yahoo import facts as yahoo_facts
 from tradingagents.graph.setup import GraphSetup
 
@@ -35,13 +41,16 @@ class _Ticker:
     })
     quarterly_cashflow = _frame({"Free Cash Flow": [7083e6, 2993e6, 980e6, 438e6, 49e6]})
     insider_transactions = pd.DataFrame({
-        "Start Date": pd.to_datetime(["2026-09-17", "2026-09-15", "2026-09-17"]),
-        "Insider": ["CEO PERSON", "CFO PERSON", "CEO PERSON"],
-        "Position": ["Chief Executive Officer", "Chief Financial Officer", "Chief Executive Officer"],
+        "Start Date": pd.to_datetime(["2026-09-17", "2026-09-15", "2026-09-17", "2026-03-02"]),
+        "Insider": ["CEO PERSON", "CFO PERSON", "CEO PERSON", "CFO PERSON"],
+        "Position": ["Chief Executive Officer", "Chief Financial Officer", "Chief Executive Officer",
+                     "Chief Financial Officer"],
         "Text": ["Sale at price 1567.26 - 1587.00 per share.", "Sale at price 1568.83 per share.",
-                 "Stock Award(Grant) at price 0.00 per share."],
-        "Value": [53_272_704.0, 1_568_830.0, 0.0],
+                 "Stock Award(Grant) at price 0.00 per share.", "Sale at price 900.00 per share."],
+        "Value": [53_272_704.0, 1_568_830.0, 0.0, 900_000.0],
     })
+    income_stmt = pd.DataFrame(columns=pd.to_datetime(["2026-06-30", "2025-06-30"]))
+    info = {"financialCurrency": "USD"}
     calendar = {}
 
 
@@ -107,16 +116,101 @@ def test_the_checker_flags_the_misread_multiple_and_passes_the_true_numbers(vend
     text = ("Receivables grew 341% against a 470% revenue surge. Revenue is 4.7x a year ago, "
             "up 372%. Trim 45% of the position.")
 
-    flagged = unverified_claims(text, sheet, references=[])
+    got = classify_claims(text, sheet, references=[])
 
-    assert [f.split(" ")[0] for f in flagged] == ["470%", "45%"]
+    assert [f.split(" ")[0] for f in got["unsupported"]] == ["470%"]
+    assert [f.split(" ")[0] for f in got["verified"]] == ["341%", "4.7x", "372%"]
+    assert [f.split(" ")[0] for f in got["proposal"]] == ["45%"]
+
+
+def _id(sheet, prefix):
+    return next(f["id"] for f in sheet["facts"] if f["label"].startswith(prefix))
 
 
 @pytest.mark.unit
-def test_numbers_the_analysts_reported_are_not_flagged(vendor):
+@pytest.mark.parametrize("text", [
+    "receivables grew 4.7x faster than revenue",            # right number, wrong subject
+    "revenue fell 50.7% from the prior quarter",           # right number, wrong direction
+    "revenue grew 470 percent",                            # spelled out
+    "revenue is 6.2 times its year-ago level",             # spelled out multiple
+])
+def test_the_checker_catches_what_a_bare_number_match_would_pass(vendor, text):
     sheet = yahoo_facts.build_fact_sheet("SNDK", "2026-09-24")
 
-    assert unverified_claims("a -7.5% pullback", sheet, ["closed -7.5% from the high"]) == []
+    assert unverified_claims(text, sheet, references=[]), text
+
+
+@pytest.mark.unit
+def test_a_cited_number_must_agree_with_the_fact_it_cites(vendor):
+    sheet = yahoo_facts.build_fact_sheet("SNDK", "2026-09-24")
+    yoy = _id(sheet, "Revenue growth year over year")
+    qoq = _id(sheet, "Revenue growth vs prior quarter")
+
+    assert unverified_claims(f"revenue grew 371.6% [{yoy}]", sheet, []) == []
+    assert unverified_claims(f"revenue grew 371.6% [{qoq}]", sheet, [])
+
+
+@pytest.mark.unit
+def test_locale_and_range_forms_are_read(vendor):
+    sheet = yahoo_facts.build_fact_sheet("SNDK", "2026-09-24")
+
+    assert unverified_claims("le chiffre d'affaires est 4,7x", sheet, []) == []
+    assert [f.split(" ")[0] for f in unverified_claims("somewhere 300-372%", sheet, [])] == ["300%"]
+
+
+@pytest.mark.unit
+def test_a_number_found_only_in_a_report_is_sourced_not_verified(vendor):
+    sheet = yahoo_facts.build_fact_sheet("SNDK", "2026-09-24")
+
+    got = classify_claims("a 12.3% pullback", sheet, ["closed 12.3% below the high"])
+
+    assert got["unsupported"] == [] and got["verified"] == []
+    assert got["report"][0].startswith("12.3%")
+
+
+@pytest.mark.unit
+def test_the_footer_never_reads_as_a_rating(vendor):
+    state = {"fact_sheet": yahoo_facts.build_fact_sheet("SNDK", "2026-09-24")}
+    decision = "**Rating**: Buy\n\nOur rating: 470% upside."
+
+    text, _ = check_decision(decision, state, llm=None)
+
+    assert parse_rating(text) == "Buy"
+    assert "rating" not in text[len(decision):].lower()
+
+
+@pytest.mark.unit
+def test_insider_history_the_vendor_does_not_reach_is_a_gap(vendor, monkeypatch):
+    recent_only = _Ticker.insider_transactions.iloc[:3]
+    monkeypatch.setattr(yahoo_facts.yf, "Ticker", lambda s: type("T", (_Ticker,), {"insider_transactions": recent_only})())
+
+    sheet = yahoo_facts.build_fact_sheet("SNDK", "2026-09-24")
+
+    assert not any(f["label"].startswith("Insider") for f in sheet["facts"])
+    assert any(g.startswith("insider transactions before") for g in sheet["gaps"])
+
+
+@pytest.mark.unit
+def test_statement_money_is_labelled_in_its_own_currency(vendor, monkeypatch):
+    monkeypatch.setattr(yahoo_facts.yf, "Ticker",
+                        lambda s: type("T", (_Ticker,), {"info": {"financialCurrency": "JPY"}})())
+
+    sheet = yahoo_facts.build_fact_sheet("7203.T", "2026-09-24")
+    rev = next(f for f in sheet["facts"] if f["label"].startswith("Revenue, latest"))
+
+    assert rev["currency"] == "JPY" and "JPY" in render_fact_sheet(sheet)
+    insider = next(f for f in sheet["facts"] if f["label"].startswith("Insider open-market sales"))
+    assert insider["currency"] == "USD"
+
+
+@pytest.mark.unit
+def test_a_fiscal_year_end_quarter_waits_for_the_10k(vendor):
+    # 2026-06-30 is a fiscal year end here: 60 days on, a 10-Q quarter would
+    # be public but a 10-K quarter is not yet.
+    facts = _by_label(yahoo_facts.build_fact_sheet("SNDK", "2026-08-29"))
+
+    assert not any("2026-06-30" in label for label in facts)
+    assert "Revenue, latest quarter (2026-03-31)" in facts
 
 
 class _Reviser:
@@ -138,9 +232,12 @@ def test_an_unsupported_number_is_revised_once_and_what_remains_is_listed(vendor
     text, result = check_decision(decision, state, llm)
 
     assert len(llm.prompts) == 1 and "470%" in llm.prompts[0]
-    assert result["revised"] and (result["rating_before"], result["rating_after"]) == ("Underweight", "Hold")
-    assert [r.split(" ")[0] for r in result["remaining"]] == ["45%"]
-    assert "Underweight → Hold" in text and "Still not found" in text
+    assert result["revised"] and (result["call_before"], result["call_after"]) == ("Underweight", "Hold")
+    assert result["final"]["unsupported"] == []
+    assert [r.split(" ")[0] for r in result["final"]["proposal"]] == ["45%"]
+    assert "from Underweight to Hold" in text
+    # The run's signal is parsed from the text with the footer attached.
+    assert parse_rating(text) == "Hold"
 
 
 @pytest.mark.unit
@@ -152,7 +249,8 @@ def test_a_revision_without_a_rating_is_discarded(vendor):
 
     assert not result["revised"]
     assert text.startswith(decision)
-    assert result["remaining"] and result["remaining"][0].startswith("470%")
+    assert result["final"]["unsupported"][0].startswith("470%")
+    assert parse_rating(text) == "Sell"
 
 
 @pytest.mark.unit

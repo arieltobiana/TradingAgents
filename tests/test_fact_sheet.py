@@ -292,3 +292,14 @@ def test_the_fact_check_node_follows_the_config(enabled):
 
 def test_rules_explain_the_multiple_confusion():
     assert "4.72x" in agent_facts.FACT_RULES and "470%" in agent_facts.FACT_RULES
+
+
+@pytest.mark.unit
+def test_a_proposal_referred_back_to_is_still_a_proposal(vendor):
+    sheet = yahoo_facts.build_fact_sheet("SNDK", "2026-09-24")
+    text = "Trim to 60-70% of a full position. A break lower would justify going below the 60-70% band."
+
+    got = classify_claims(text, sheet, [])
+
+    assert got["unsupported"] == []
+    assert len(got["proposal"]) == 4

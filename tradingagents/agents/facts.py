@@ -178,7 +178,11 @@ def classify_claims(text: str, sheet: Mapping[str, Any] | None,
     report_forms = [(c["unit"], c["value"], 0) for t in references for c in _claims(t)]
     out: dict[str, list[str]] = {"verified": [], "report": [], "proposal": [], "unsupported": []}
     seen = set()
-    for c in _claims(text):
+    claims = _claims(text)
+    # A proposal is often referred back to later ("below the 60-70% band"),
+    # where the clause no longer carries the action word.
+    proposed = {(c["value"], c["unit"]) for c in claims if c["proposal"] and c["cite"] is None}
+    for c in claims:
         label = f"{c['value']:g}{'%' if c['unit'] == 'pct' else 'x'}"
         if c["cite"] is not None:
             fact = facts.get(c["cite"])
@@ -186,7 +190,7 @@ def classify_claims(text: str, sheet: Mapping[str, Any] | None,
                 kind = "verified"
             else:
                 kind, label = "unsupported", f"{label} (does not match the cited [F{c['cite']}])"
-        elif c["proposal"]:
+        elif c["proposal"] or (c["value"], c["unit"]) in proposed:
             kind = "proposal"
         elif c["comparison"]:
             kind, label = "unsupported", f"{label} (a comparison that cites no fact)"

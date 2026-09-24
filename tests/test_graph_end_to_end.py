@@ -20,7 +20,11 @@ from pydantic import Field
 from tradingagents.agents import context, schemas
 from tradingagents.agents.analysts import sentiment_analyst
 from tradingagents.dataflows import router
-from tradingagents.dataflows.vendors.yahoo import market as yahoo_market, snapshot
+from tradingagents.dataflows.vendors.yahoo import (
+    facts as yahoo_facts,
+    market as yahoo_market,
+    snapshot,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph import trading_graph
 
@@ -106,7 +110,10 @@ def offline(monkeypatch, tmp_path):
                         lambda *a, **k: called.add("ohlcv") or prices.copy())
     monkeypatch.setattr(sentiment_analyst, "fetch_stocktwits_messages", lambda *a, **k: "no posts")
     monkeypatch.setattr(sentiment_analyst, "fetch_reddit_posts", lambda *a, **k: "no posts")
+    # One yfinance module serves both readers: the profile answers, and the fact
+    # sheet's statement reads find nothing and are reported as gaps.
     monkeypatch.setattr(yahoo_market.yf, "Ticker", lambda s: type("T", (), {"info": {"longName": "NVIDIA"}})())
+    monkeypatch.setattr(yahoo_facts, "load_ohlcv", lambda *a, **k: prices.copy())
     context.resolve_instrument_identity.cache_clear()
     return called
 
@@ -136,6 +143,9 @@ def test_a_full_run_reaches_a_logged_decision(tmp_path, monkeypatch, offline, st
                     "get_insider_transactions", "ohlcv"}
     assert offline == tool_methods
     assert [e["rating"] for e in graph.memory_log.load_entries()] == ["Overweight"]
+    assert state["fact_sheet"]["facts"], "the fact sheet reached the run"
+    assert state["fact_check"]["status"] == "checked"
+    assert "**Fact check**" in state["final_trade_decision"]
 
 
 @pytest.mark.unit

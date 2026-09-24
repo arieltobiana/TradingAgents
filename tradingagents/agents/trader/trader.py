@@ -11,6 +11,7 @@ from tradingagents.agents.context import (
     get_language_instruction,
     get_portfolio_context_from_state,
 )
+from tradingagents.agents.facts import fact_sheet_block
 from tradingagents.agents.schemas import TraderProposal, render_trader_proposal
 from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
@@ -69,6 +70,7 @@ def create_trader(llm):
                     f"Here is the research team's investment plan for {company_name}. "
                     f"{instrument_context}\n\n"
                     f"{report_section}"
+                    f"{fact_sheet_block(state)}\n\n"
                     f"{portfolio_context}\n\n"
                     f"Proposed Investment Plan:\n{investment_plan}\n\n"
                     "Make an informed, strategic trading decision.\n\n"

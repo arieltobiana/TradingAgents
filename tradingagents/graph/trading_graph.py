@@ -11,6 +11,7 @@ from tradingagents.agents.rating import parse_rating
 from tradingagents.dataflows.config import run_config, set_config
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.symbols import safe_ticker_component
+from tradingagents.dataflows.vendors.yahoo.facts import build_fact_sheet
 from tradingagents.decision_log import TradingMemoryLog
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import build_llm_kwargs, create_llm_client
@@ -98,6 +99,7 @@ class TradingAgentsGraph:
             self.quick_thinking_llm,
             self.deep_thinking_llm,
             self.conditional_logic,
+            fact_check=self.config.get("fact_check_enabled", True),
         )
 
         self.propagator = Propagator(
@@ -275,7 +277,15 @@ class TradingAgentsGraph:
             ),
             instrument_context=self.resolve_instrument_context(company_name, asset_type, trade_date),
             portfolio_context=portfolio.render(company_name) if portfolio is not None else "",
+            fact_sheet=self._fact_sheet(company_name, trade_date, asset_type),
         )
+
+    def _fact_sheet(self, company_name, trade_date, asset_type) -> dict:
+        """The run's code-computed facts, or {} when disabled (never raises)."""
+        if not self.config.get("fact_check_enabled", True):
+            return {}
+        with run_config(self.config):
+            return build_fact_sheet(company_name, str(trade_date), asset_type)
 
     def settle_pending(self, company_name):
         """Settle this ticker's decisions whose holding window has now traded.
@@ -373,6 +383,8 @@ class TradingAgentsGraph:
             },
             "investment_plan": final_state["investment_plan"],
             "final_trade_decision": final_state["final_trade_decision"],
+            "fact_sheet": final_state.get("fact_sheet", {}),
+            "fact_check": final_state.get("fact_check", {}),
         }
 
         # A ticker that would escape the results directory is rejected.

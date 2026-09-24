@@ -18,6 +18,7 @@ from tradingagents.agents import (
     create_sentiment_analyst,
     create_trader,
 )
+from tradingagents.agents.facts import create_fact_checker
 from tradingagents.agents.state import AgentState
 
 from .analyst_execution import build_analyst_execution_plan
@@ -55,8 +56,10 @@ class GraphSetup:
         quick_thinking_llm: Any,
         deep_thinking_llm: Any,
         conditional_logic: ConditionalLogic,
+        fact_check: bool = True,
     ):
         """Initialize with required components."""
+        self.fact_check = fact_check
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
         self.conditional_logic = conditional_logic
@@ -141,6 +144,11 @@ class GraphSetup:
                 RISK_ANALYSIS_PATH_MAP,
             )
 
-        workflow.add_edge("Portfolio Manager", END)
+        if self.fact_check:
+            workflow.add_node("Fact Check", create_fact_checker(self.deep_thinking_llm))
+            workflow.add_edge("Portfolio Manager", "Fact Check")
+            workflow.add_edge("Fact Check", END)
+        else:
+            workflow.add_edge("Portfolio Manager", END)
 
         return workflow

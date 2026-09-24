@@ -38,6 +38,9 @@ FACT_RULES = (
     "3. A percentage change and a multiple are different things: +371.6% growth is 4.72x the "
     "base, not 471.6% or 470%. Copy whichever form the fact sheet states.\n"
     "4. If a report or argument conflicts with the fact sheet, the fact sheet is right; say so.\n"
+    "   A claim the fact sheet does not cover is UNVERIFIED, not false: say it is unverified and "
+    "weigh it by how plausible it is. Do not treat its absence from the sheet as evidence against "
+    "it.\n"
     "5. When a sentence compares two figures (faster, slower, outpaced, more than), cite the "
     "fact that states the comparison."
 )

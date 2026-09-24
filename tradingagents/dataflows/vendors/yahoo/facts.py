@@ -313,8 +313,23 @@ def _fundamental_facts(sheet: _Sheet, symbol: str, trade_date: str) -> None:
             s = _row(bal, *names)
             if s is not None:
                 sheet.add(f"{label}, latest quarter", float(s.iloc[0]), "money", src)
+        # Customer prepayments: revenue already paid for and not yet earned.
+        # Left off the sheet, a true claim about it read as unverifiable and
+        # was discounted (IREN, $1.84B at 2026-06-30).
+        parts = [p for p in (_row(bal, "Current Deferred Revenue"), _row(bal, "Non Current Deferred Revenue"))
+                 if p is not None]
+        if parts:
+            deferred = pd.concat(parts, axis=1).fillna(0).sum(axis=1)
+            deferred = deferred[sorted(deferred.index, key=pd.Timestamp, reverse=True)]
+            sheet.add("Deferred revenue (customer prepayments), latest quarter", float(deferred.iloc[0]), "money", src)
+            prior = _dated(deferred, deferred.index[0], 91, _YEAR_AGO_TOLERANCE_DAYS)
+            if prior is not None:
+                sheet.add("Deferred revenue, prior quarter", float(deferred[prior]), "money", src)
 
     if not cf.empty:
+        ocf = _row(cf, "Operating Cash Flow")
+        if ocf is not None:
+            sheet.add("Operating cash flow, latest quarter", float(ocf.iloc[0]), "money", src)
         fcf = _row(cf, "Free Cash Flow")
         if fcf is not None:
             # Operating cash flow minus what this vendor classes as capital

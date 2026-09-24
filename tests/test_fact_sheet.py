@@ -38,6 +38,8 @@ class _Ticker:
         "Accounts Receivable": [4708e6, 2726e6, 1239e6, 1193e6, 1068e6],
         "Cash And Cash Equivalents": [4762e6, 3735e6, 1539e6, 1442e6, 1481e6],
         "Total Debt": [177e6, 200e6, 603e6, 1351e6, 2042e6],
+        "Current Deferred Revenue": [849e6, 323e6, float("nan"), float("nan"), float("nan")],
+        "Non Current Deferred Revenue": [393e6, 188e6, float("nan"), float("nan"), float("nan")],
     })
     quarterly_cashflow = _frame({"Free Cash Flow": [7083e6, 2993e6, 980e6, 438e6, 49e6]})
     insider_transactions = pd.DataFrame({
@@ -84,6 +86,8 @@ def test_growth_is_stated_as_percent_and_as_multiple_and_the_comparison_is_compu
         "receivables grew SLOWER than revenue: days sales outstanding fell from 51 to 48 days")
     assert facts["Days sales outstanding, latest quarter"]["value"] == pytest.approx(47.8, abs=0.1)
     assert facts["Insider open-market purchases, last 90 days (value)"]["value"] == 0
+    assert facts["Deferred revenue (customer prepayments), latest quarter"]["value"] == 1242e6
+    assert facts["Deferred revenue, prior quarter"]["value"] == 511e6
     assert facts["Insider sales by CEO PERSON (Chief Executive Officer)"]["value"] == pytest.approx(53_272_704)
 
 
@@ -293,6 +297,10 @@ def test_the_fact_check_node_follows_the_config(enabled):
 
 def test_rules_explain_the_multiple_confusion():
     assert "4.72x" in agent_facts.FACT_RULES and "470%" in agent_facts.FACT_RULES
+
+
+def test_rules_say_an_uncovered_claim_is_unverified_not_false():
+    assert "UNVERIFIED, not false" in agent_facts.FACT_RULES
 
 
 @pytest.mark.unit

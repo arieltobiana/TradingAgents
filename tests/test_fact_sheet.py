@@ -321,3 +321,18 @@ def test_receivables_off_a_tiny_base_get_no_growth_rate_and_no_comparison(vendor
     assert "Receivables vs revenue, year over year" not in labels
     assert "Days sales outstanding, latest quarter" in labels
     assert any(g.startswith("accounts receivable growth rate") for g in sheet["gaps"])
+
+
+@pytest.mark.unit
+def test_citation_lists_are_read_and_a_citation_belongs_to_the_number_before_it(vendor):
+    sheet = yahoo_facts.build_fact_sheet("SNDK", "2026-09-24")
+    yoy, mult = _id(sheet, "Revenue growth year over year"), _id(sheet, "Revenue year over year as a multiple")
+    five = next(f for f in sheet["facts"] if f["label"] == "Price change over last 5 sessions")
+    text = (f"Revenue rose 371.6% [{yoy}, {mult}] to 4.72x [{yoy} and {mult}]. "
+            f"Trim to 55-58% of a position into strength (+{five['value']:.1f}% over 5 sessions [{five['id']}]).")
+
+    got = classify_claims(text, sheet, [])
+
+    assert got["unsupported"] == []
+    assert [v.split(" ")[0] for v in got["verified"]] == ["371.6%", "4.72x", f"{five['value']:.1f}%"]
+    assert [p.split(" ")[0] for p in got["proposal"]] == ["55%", "58%"]

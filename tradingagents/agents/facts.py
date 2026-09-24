@@ -85,7 +85,13 @@ _CLAIM = re.compile(
     rf"\s*(?P<unit>{_UNIT})",
     re.IGNORECASE,
 )
-_CITE = re.compile(r"\[F(\d+)\]")
+# "[F12]", "[F14, F15]", "[F27 and F28]", "[F31-F32]".
+_CITE = re.compile(r"\[(F\d+(?:\s*(?:,|;|&|and|-|\u2013)\s*F?\d+)*)\]")
+_CITE_WINDOW = 70
+
+
+def _cited_ids(text: str) -> list[int]:
+    return [int(n) for group in _CITE.findall(text) for n in re.findall(r"\d+", group)]
 _CLAUSE_BREAK = re.compile(r"[.;:,\n()—]")
 _PROPOSAL = re.compile(
     r"\b(trim|sell|reduce|cut|size|sizing|allocat\w*|position|stake|weight|exposure|stop|"
@@ -117,7 +123,8 @@ def _claims(text: str) -> list[dict]:
     """Each % or multiple number in ``text``, with the context the checker needs."""
     out = []
     text = text or ""
-    for m in _CLAIM.finditer(text):
+    matches = list(_CLAIM.finditer(text))
+    for i, m in enumerate(matches):
         unit = "pct" if re.search(r"%|cent", m.group("unit"), re.IGNORECASE) else "x"
         line_start = text.rfind("\n", 0, m.start()) + 1
         line_end = text.find("\n", m.end())
@@ -126,8 +133,13 @@ def _claims(text: str) -> list[dict]:
         clause = _CLAUSE_BREAK.split(before)[-1][-60:]
         sentence_end = min((i for i in (text.find(". ", m.end()), line_end) if i != -1), default=line_end)
         after = text[m.end():min(sentence_end, m.end() + 80)]
+        # A citation belongs to this number only if it comes before the next
+        # number: "+6.1% over 5 sessions [F4]" does not cite a trim size
+        # stated earlier in the same sentence.
+        next_start = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        cite_window = text[m.end():min(sentence_end, next_start, m.end() + _CITE_WINDOW)]
         sentence = text[max(line_start, text.rfind(". ", 0, m.start()) + 1):sentence_end]
-        cite = _CITE.search(after) or _CITE.search(clause)
+        cites = _cited_ids(cite_window) or _cited_ids(clause)
         snippet = " ".join(text[max(line_start, m.start() - 80):min(line_end, m.end() + 40)].split())
         for raw in filter(None, (m.group("a"), m.group("b"))):
             value = _to_float(raw)
@@ -135,7 +147,7 @@ def _claims(text: str) -> list[dict]:
                          1 if raw.startswith("+") or _UP.search(clause) else 0)
             out.append({
                 "value": abs(value), "unit": unit, "decimals": _decimals(raw), "snippet": snippet,
-                "direction": direction, "cite": int(cite.group(1)) if cite else None,
+                "direction": direction, "cites": cites,
                 "proposal": bool(_PROPOSAL.search(clause)) or bool(re.match(r"\s*ATR\b", after)),
                 "comparison": bool(_COMPARISON.search(sentence)),
             })
@@ -181,15 +193,15 @@ def classify_claims(text: str, sheet: Mapping[str, Any] | None,
     claims = _claims(text)
     # A proposal is often referred back to later ("below the 60-70% band"),
     # where the clause no longer carries the action word.
-    proposed = {(c["value"], c["unit"]) for c in claims if c["proposal"] and c["cite"] is None}
+    proposed = {(c["value"], c["unit"]) for c in claims if c["proposal"] and not c["cites"]}
     for c in claims:
         label = f"{c['value']:g}{'%' if c['unit'] == 'pct' else 'x'}"
-        if c["cite"] is not None:
-            fact = facts.get(c["cite"])
-            if fact is not None and _agrees(c, _fact_forms(fact)):
+        if c["cites"]:
+            if any(i in facts and _agrees(c, _fact_forms(facts[i])) for i in c["cites"]):
                 kind = "verified"
             else:
-                kind, label = "unsupported", f"{label} (does not match the cited [F{c['cite']}])"
+                cited = ", ".join(f"F{i}" for i in c["cites"])
+                kind, label = "unsupported", f"{label} (does not match the cited [{cited}])"
         elif c["proposal"] or (c["value"], c["unit"]) in proposed:
             kind = "proposal"
         elif c["comparison"]:

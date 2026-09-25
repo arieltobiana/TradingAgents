@@ -194,6 +194,41 @@ def fetch_alpaca(symbol: str, symbols: list[str] | None = None) -> list[Quote]:
     return quotes
 
 
+def fetch_chain(symbol: str) -> tuple[dict, list[Quote]]:
+    """The whole chain from Cboe, or from Alpaca when Cboe fails; ``meta["feed"]`` names the kind."""
+    try:
+        meta, chain = fetch_cboe(symbol)
+        meta.setdefault("feed", "delayed")
+    except Exception as exc:  # noqa: BLE001 — fall back to the second source
+        logger.warning("options: Cboe unavailable for %s (%s); trying Alpaca", symbol, exc)
+        chain = fetch_alpaca(symbol)
+        meta = {"source": "Alpaca indicative feed", "as_of": datetime.now(NY).isoformat(timespec="minutes"),
+                "spot": None, "iv30": None, "session": None, "feed": "indicative"}
+    return meta, chain
+
+
+def _archive(cache_dir, symbol: str, meta: dict, chain: list[Quote]) -> Path | None:
+    """Keep this chain for later replay; archiving must never cost the fact sheet its section."""
+    if not cache_dir:
+        return None
+    try:
+        from tradingagents.options.archive import record_chain_snapshot
+
+        return record_chain_snapshot(os.fspath(cache_dir), symbol, meta, chain)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("options: could not archive the %s chain: %s", symbol, exc)
+        return None
+
+
+def _archive_candidates(snapshot: Path, right: str, trade_date: str, candidates: list[Quote]) -> None:
+    try:
+        from tradingagents.options.archive import record_candidates
+
+        record_candidates(snapshot, right, trade_date, [q.symbol for q in candidates])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("options: could not archive the candidates for %s: %s", snapshot.name, exc)
+
+
 # ----------------------------------------------------------- earnings dates
 
 def earnings_events(symbol: str) -> list[tuple[pd.Timestamp, str]]:
@@ -307,13 +342,8 @@ def option_facts(sheet, symbol: str, trade_date: str, right: str, cache_dir: str
         sheet.gaps.append("options (quotes and greeks are live-only; not available for a past date)")
         return
     today = date.fromisoformat(ny_today())
-    try:
-        meta, chain = fetch_cboe(symbol)
-    except Exception as exc:  # noqa: BLE001 — fall back to the second source
-        logger.warning("options: Cboe unavailable for %s (%s); trying Alpaca", symbol, exc)
-        chain = fetch_alpaca(symbol)
-        meta = {"source": "Alpaca indicative feed", "as_of": datetime.now(NY).isoformat(timespec="minutes"),
-                "spot": None, "iv30": None, "session": None}
+    meta, chain = fetch_chain(symbol)
+    snapshot = _archive(cache_dir, symbol, meta, chain)
     src = f"{meta['source']}, as of {meta['as_of']}"
 
     close = next((f.value for f in sheet.facts if f.label == "Latest close"), None)
@@ -470,6 +500,8 @@ def option_facts(sheet, symbol: str, trade_date: str, right: str, cache_dir: str
             parts.append(cross[q.symbol])
         sheet.add(f"Candidate {q.symbol} ({q.expiry} {q.strike:g}{q.right})",
                   "; ".join(p for p in parts if p), "text", src)
+    if snapshot is not None:
+        _archive_candidates(snapshot, right, trade_date, candidates)
 
 
 def _atm_iv(quotes: list[Quote], spot: float) -> float | None:

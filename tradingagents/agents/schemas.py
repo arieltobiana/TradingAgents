@@ -58,6 +58,46 @@ def _coerce_optional_float(value):
         return None
 
 
+# A stock view is scored against realized returns at its own horizon, so a value
+# that is not a clean direction and day count is dropped rather than guessed at:
+# a mis-read view would be scored as a call the model never made.
+VIEW_DIRECTIONS = ("up", "down", "flat")
+VIEW_MAX_DAYS = 252  # one trading year; further out is not a view anyone can settle
+# "flat" is a claim that the move stays inside this band, either way. One fixed
+# band keeps the claim and its scoring the same thing across horizons.
+VIEW_FLAT_BAND = 0.02
+
+
+def _coerce_view_direction(value):
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    return text if text in VIEW_DIRECTIONS else None
+
+
+def _coerce_view_days(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.isdigit():
+            return None
+    try:
+        days = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not days.is_integer() or not 1 <= days <= VIEW_MAX_DAYS:
+        return None
+    return int(days)
+
+
+def render_view(direction: str | None, days: int | None) -> str:
+    """The ``**View**`` line, which the backtest parses back out of the decision log."""
+    if direction is None or days is None:
+        return "**View**: not provided"
+    return f"**View**: {direction} over {days} trading day{'s' if days != 1 else ''}"
+
+
 # ---------------------------------------------------------------------------
 # Shared rating types
 # ---------------------------------------------------------------------------
@@ -258,6 +298,23 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional recommended holding period, e.g. '3-6 months'.",
     )
+    view_direction: Literal["up", "down", "flat"] | None = Field(
+        default=None,
+        description=(
+            "Where you expect the stock's own price to go over view_horizon_days "
+            "trading days from the analysis date: up, down, or flat (a move smaller "
+            f"than {VIEW_FLAT_BAND:.0%} either way). This is a forecast about the stock, independent of "
+            "the rating's portfolio framing: a Hold or an Underweight can still "
+            "expect up. It is scored against the realized price at that horizon."
+        ),
+    )
+    view_horizon_days: int | None = Field(
+        default=None,
+        description=(
+            "The horizon of view_direction as a whole number of trading days, from "
+            f"1 to {VIEW_MAX_DAYS} (about 21 per month), e.g. 20."
+        ),
+    )
     option_contract: str | None = Field(
         default=None,
         description=(
@@ -285,6 +342,16 @@ class PortfolioDecision(BaseModel):
     def _nullish_float_to_none(cls, v):
         return _coerce_optional_float(v)
 
+    @field_validator("view_direction", mode="before")
+    @classmethod
+    def _junk_direction_to_none(cls, v):
+        return _coerce_view_direction(v)
+
+    @field_validator("view_horizon_days", mode="before")
+    @classmethod
+    def _junk_days_to_none(cls, v):
+        return _coerce_view_days(v)
+
 
 def render_pm_decision(decision: PortfolioDecision) -> str:
     """Render a PortfolioDecision back to the markdown shape the rest of the system expects.
@@ -306,6 +373,7 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
     target = decision.price_target if decision.price_target is not None else "not provided"
     parts.extend(["", f"**Price Target**: {target}"])
     parts.extend(["", f"**Time Horizon**: {decision.time_horizon or 'not provided'}"])
+    parts.extend(["", render_view(decision.view_direction, decision.view_horizon_days)])
     if decision.option_contract:
         limit = decision.option_limit_price
         parts.extend(["", f"**Option**: {decision.option_contract}"

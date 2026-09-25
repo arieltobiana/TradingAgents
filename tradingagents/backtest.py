@@ -17,14 +17,18 @@ cell rather than a position carried forward.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from tradingagents.agents.rating import RATING_REVIEW
+from tradingagents.agents.schemas import VIEW_DIRECTIONS, VIEW_FLAT_BAND, VIEW_MAX_DAYS
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.decision_log import TradingMemoryLog
+from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.graph.settlement import fetch_returns, resolve_benchmark
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 logger = logging.getLogger(__name__)
@@ -175,15 +179,19 @@ def run_backtest(
     return result
 
 
-def summarize(source: BacktestResult | str | Path) -> BacktestSummary:
-    """Score the settled decisions of a backtest, or of a decision log at a path, by rating."""
+def _log_entries(source: BacktestResult | str | Path) -> list[dict]:
     if isinstance(source, BacktestResult):
         path = source.log_path      # a run whose cells all failed wrote no log: nothing to score
     elif Path(source).is_file():
         path = Path(source)
     else:
         raise FileNotFoundError(f"no decision log at {source}")
-    entries = TradingMemoryLog({"memory_log_path": str(path)}).load_entries()
+    return TradingMemoryLog({"memory_log_path": str(path)}).load_entries()
+
+
+def summarize(source: BacktestResult | str | Path) -> BacktestSummary:
+    """Score the settled decisions of a backtest, or of a decision log at a path, by rating."""
+    entries = _log_entries(source)
     # A decision with no readable rating has no direction, so it can neither
     # count for nor against the system; it is reported as unscored instead.
     resolved = [(e, _alpha(e)) for e in entries
@@ -206,3 +214,111 @@ def summarize(source: BacktestResult | str | Path) -> BacktestSummary:
                            pending=len(entries) - len(resolved) - unscored,
                            by_rating=by_rating, unscored=unscored,
                            holding=", ".join(sorted(windows)) or "the configured window")
+
+
+# --- stock views -------------------------------------------------------------
+#
+# A rating is a portfolio instruction; the view is the model's forecast for the
+# stock itself, with its own horizon. It is scored separately so that a question
+# like "does the model's direction predict returns?" is not answered with numbers
+# about sizing advice, and at the horizon the view states rather than the
+# configured holding period.
+
+_VIEW_LINE = re.compile(r"^\W*\*\*View\*\*\s*:(.*)$", re.IGNORECASE | re.MULTILINE)
+_VIEW_VALUE = re.compile(r"^\s*(\w+)\s+over\s+(\d{1,4})\s+trading\s+days?\W*$", re.IGNORECASE)
+
+
+def parse_view(text: str) -> tuple[str, int] | None:
+    """``(direction, trading_days)`` from a decision's ``**View**`` line, or None.
+
+    Only the exact shape ``render_view`` writes is read. Anything else, a view
+    "not provided" included, is None: a loosely read view would score a call
+    the model never made.
+    """
+    lines = _VIEW_LINE.findall(text or "")
+    if not lines:
+        return None
+    m = _VIEW_VALUE.match(lines[-1])  # the decision states its view last, like its rating
+    if not m:
+        return None
+    direction, days = m.group(1).lower(), int(m.group(2))
+    if direction not in VIEW_DIRECTIONS or not 1 <= days <= VIEW_MAX_DAYS:
+        return None
+    return direction, days
+
+
+def _view_hit(direction: str, raw: float) -> bool:
+    if direction == "up":
+        return raw > 0
+    if direction == "down":
+        return raw < 0
+    return abs(raw) < VIEW_FLAT_BAND
+
+
+@dataclass
+class ViewScore:
+    count: int
+    hit_rate: float
+    mean_raw: float
+    mean_alpha: float
+
+
+@dataclass
+class ViewSummary:
+    resolved: int
+    pending: int
+    unscored: int
+    by_direction: dict[str, ViewScore]
+
+    def render(self) -> str:
+        lines = [f"Stock views resolved: {self.resolved} · pending: {self.pending}"
+                 + (f" · no readable view: {self.unscored}" if self.unscored else "")]
+        for direction, score in self.by_direction.items():
+            lines.append(
+                f"- {direction}: n={score.count}, right {score.hit_rate:.0%}, "
+                f"mean return {score.mean_raw:+.2%}, mean alpha {score.mean_alpha:+.2%}"
+            )
+        lines.append("")
+        lines.append(
+            "Each view is measured over the trading days it states, from its analysis "
+            f"date. Flat is right when the stock moved less than {VIEW_FLAT_BAND:.0%} "
+            "either way. Pending views have not traded their horizon yet, or had no prices."
+        )
+        return "\n".join(lines)
+
+
+def summarize_views(source: BacktestResult | str | Path, config: dict | None = None) -> ViewSummary:
+    """Score each decision's stock view against the stock's return at the view's own horizon.
+
+    Independent of settlement: a view is scored whether or not its rating has
+    settled, since the two horizons differ. ``config`` supplies the benchmark
+    for alpha (defaults to ``DEFAULT_CONFIG``).
+    """
+    config = config or DEFAULT_CONFIG
+    scored: dict[str, list[tuple[bool, float, float]]] = {}
+    pending = unscored = 0
+    for entry in _log_entries(source):
+        view = parse_view(entry.get("decision", ""))
+        if view is None:
+            unscored += 1
+            continue
+        direction, days = view
+        ticker = entry["ticker"]
+        raw, alpha, _, _ = fetch_returns(ticker, entry["date"], holding_days=days,
+                                         benchmark=resolve_benchmark(ticker, config))
+        if raw is None:
+            pending += 1  # the horizon has not traded yet, or prices are unreachable
+            continue
+        scored.setdefault(direction, []).append((_view_hit(direction, raw), raw, alpha))
+
+    by_direction = {
+        d: ViewScore(
+            count=len(rows),
+            hit_rate=sum(hit for hit, _, _ in rows) / len(rows),
+            mean_raw=sum(raw for _, raw, _ in rows) / len(rows),
+            mean_alpha=sum(alpha for _, _, alpha in rows) / len(rows),
+        )
+        for d in VIEW_DIRECTIONS if (rows := scored.get(d))
+    }
+    return ViewSummary(resolved=sum(s.count for s in by_direction.values()),
+                       pending=pending, unscored=unscored, by_direction=by_direction)

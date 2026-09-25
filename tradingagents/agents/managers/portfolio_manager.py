@@ -80,6 +80,7 @@ Write these sections, in this order, starting with the rating on its own line:
 - **Rating**: exactly one of Buy / Overweight / Hold / Underweight / Sell
 - **Executive Summary**: the call and how to act on it
 - **Investment Thesis**: the evidence that decided it, and what would change it
+- **View**: where the stock itself goes, exactly "up", "down" or "flat" (under 2% either way) "over N trading days", e.g. "up over 20 trading days"; independent of the rating
 
 {NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
 

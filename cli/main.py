@@ -4,7 +4,7 @@ import typer
 
 from cli.display import console
 from cli.run import run_analysis
-from tradingagents.backtest import iter_grid, run_backtest, summarize
+from tradingagents.backtest import iter_grid, run_backtest, summarize, summarize_views
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.portfolio import load_portfolio
 
@@ -119,6 +119,9 @@ def backtest(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from None
     console.print(summarize(result).render())
+    if result.log_path.exists():  # no log means no decisions, so no views either
+        console.print()
+        console.print(summarize_views(result.log_path, DEFAULT_CONFIG).render())
     console.print(f"\nRan {result.cells_run} cells, skipped {result.skipped}. Log: {result.log_path}")
     for ticker, date, reason in result.failures:
         console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")

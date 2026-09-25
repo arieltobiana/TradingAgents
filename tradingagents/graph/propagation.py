@@ -19,6 +19,7 @@ class Propagator:
         instrument_context: str = "",
         portfolio_context: str = "",
         fact_sheet: dict | None = None,
+        option_question: str | None = None,
     ) -> dict[str, Any]:
         """Create the initial state for the agent graph.
 
@@ -38,6 +39,7 @@ class Propagator:
             "portfolio_context": portfolio_context,
             "fact_sheet": fact_sheet or {},
             "fact_check": {},
+            "option_question": option_question or "",
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",

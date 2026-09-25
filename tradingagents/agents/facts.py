@@ -71,6 +71,22 @@ def render_fact_sheet(sheet: Mapping[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
+def option_task_block(state: Mapping[str, Any]) -> str:
+    """The option question for the agents that decide, or '' when the run has none."""
+    side = state.get("option_question")
+    if not side:
+        return ""
+    return f"""THE QUESTION FOR THIS RUN: which {side} to buy on this stock, if any.
+Answer with ONE contract from the fact sheet's "Candidate" rows (cite its F id and write its OCC symbol exactly as listed), or say plainly that no {side} should be bought. Weigh, from the fact sheet:
+- the expiry against the next earnings report ("spans earnings"), and the priced move against the stock's past earnings-day moves;
+- the breakeven move against the 1-standard-deviation move (a ratio above 1x needs more than a typical move just to break even);
+- time decay: theta as a % of the premium per day, against how long the thesis needs;
+- liquidity: the spread and open interest;
+- whether options are cheap or dear: IV30 against realized volatility, and IV rank when it is available;
+- any row marked SOURCES DISAGREE.
+A {side} is a bet on direction AND timing. If the stock view does not point that way within the contract's life, "none" is the right answer. State the limit price (at or below the ask), the size as a share of what you would put in the stock, the exit plan (a profit target on the option, a time stop before expiry, what to do before earnings), and why this strike and expiry beat the other candidates. The most you can lose is the premium paid."""
+
+
 def fact_sheet_block(state: Mapping[str, Any]) -> str:
     """The fact sheet plus the rules for using it, for insertion into a prompt."""
     return render_fact_sheet(state.get("fact_sheet")) + "\n\n" + FACT_RULES
@@ -229,6 +245,38 @@ def unverified_claims(text: str, sheet: Mapping[str, Any] | None, references: It
 
 _REPORT_LIST_LIMIT = 8
 
+_OCC_ANY = re.compile(r"\b[A-Z]{1,6}\d{6}[CP]\d{8}\b")
+_CANDIDATE = re.compile(r"^Candidate (\S+) ")
+_OPTION_LINE = re.compile(r"\*\*Option\*\*:\s*([^\n]+)")
+_SAYS_NONE = re.compile(r"\bnone\b|\bno (?:call|put)\b|\bdo not buy\b|\bdon't buy\b", re.IGNORECASE)
+
+
+def check_option(decision: str, state: Mapping[str, Any]) -> dict:
+    """For an option question: is the named contract a real candidate, bought sensibly?"""
+    side = state.get("option_question")
+    if not side:
+        return {}
+    facts = (state.get("fact_sheet") or {}).get("facts") or []
+    candidates = {m.group(1): f for f in facts if (m := _CANDIDATE.match(f["label"]))}
+    line = _OPTION_LINE.search(decision)
+    chosen = _OCC_ANY.findall(line.group(1)) if line else []
+    named = list(dict.fromkeys(_OCC_ANY.findall(decision)))
+    problems = [f"names {sym}, which is not a candidate row in the fact sheet"
+                for sym in named if sym not in candidates]
+    if not candidates:
+        problems.append(f"the fact sheet has no {side} candidates, so no contract can be checked")
+    if not chosen and not named and not _SAYS_NONE.search(line.group(1) if line else decision):
+        problems.append(f"names no {side} and does not say that none should be bought")
+    for sym in chosen:
+        fact = candidates.get(sym)
+        limit = re.search(r"limit\s*\$?([\d.]+)", line.group(1)) if line else None
+        ask = re.search(r"ask ([\d.]+)", fact["value"]) if fact else None
+        if limit and ask and float(limit.group(1)) > float(ask.group(1)) * 1.001:
+            problems.append(f"the limit {limit.group(1)} for {sym} is above its ask {ask.group(1)}")
+    return {"question": side, "chosen": chosen or named[:1],
+            "cited": {sym: candidates[sym]["id"] for sym in (chosen or named) if sym in candidates},
+            "problems": problems}
+
 
 def _footer(result: Mapping[str, Any]) -> str:
     lines = ["", "---", "**Fact check**"]
@@ -248,6 +296,15 @@ def _footer(result: Mapping[str, Any]) -> str:
         if final["unsupported"]:
             lines.append("- Unsupported (not in the fact sheet or any report):")
             lines += [f"  - {r}" for r in final["unsupported"]]
+        option = result.get("option") or {}
+        if option:
+            if option["chosen"]:
+                cited = ", ".join(f"{s} [{option['cited'][s]}]" if s in option["cited"] else s
+                                  for s in option["chosen"])
+                lines.append(f"- Option question ({option['question']}): chose {cited}.")
+            else:
+                lines.append(f"- Option question ({option['question']}): no contract chosen.")
+            lines += [f"  - PROBLEM: {p}" for p in option["problems"]]
         if final["report"]:
             lines.append("- From analyst reports only:")
             lines += [f"  - {r}" for r in final["report"][:_REPORT_LIST_LIMIT]]
@@ -260,7 +317,7 @@ def _footer(result: Mapping[str, Any]) -> str:
 
 def _revision_prompt(decision: str, flagged: list[str], state: Mapping[str, Any]) -> str:
     items = "\n".join(f"- {f}" for f in flagged)
-    return f"""You wrote the trading decision below. An automated check found numbers in it that match neither the fact sheet nor any analyst report, or that compare two figures without citing the fact that states the comparison:
+    return f"""You wrote the trading decision below. An automated check found problems in it: numbers that match neither the fact sheet nor any analyst report, comparisons that cite no fact, or an option choice that does not check out:
 
 {items}
 
@@ -268,10 +325,13 @@ For each one:
 - If it is a factual claim about the company or the price, replace it with the correct fact sheet value and cite the id (e.g. [F12]), or remove the claim.
 - If it is your own proposal (a position size, a trim fraction, a level you are recommending), keep it.
 - If a corrected fact was a reason for the rating, reconsider the rating and say in one sentence why it stands or changes.
+- For an option problem, choose a contract from the fact sheet's candidate rows (OCC symbol exactly as listed, limit at or below its ask), or say plainly that none should be bought.
 
 Keep the same structure and headings, starting with the **Rating** line. Return only the revised decision.
 
 {fact_sheet_block(state)}
+
+{option_task_block(state)}
 
 ---
 DECISION TO REVISE:
@@ -288,13 +348,15 @@ def check_decision(decision: str, state: Mapping[str, Any], llm: Any | None) -> 
     references = [state.get(k) or "" for k in
                   ("market_report", "fundamentals_report", "news_report", "sentiment_report")]
     initial = classify_claims(decision, sheet, references)
-    result = {"status": "checked", "initial": initial["unsupported"], "revised": False,
+    option = check_option(decision, state)
+    flagged = initial["unsupported"] + [f"OPTION: {p}" for p in option.get("problems", [])]
+    result = {"status": "checked", "initial": flagged, "revised": False,
               "call_before": parse_rating(decision)}
     final = initial
 
-    if initial["unsupported"] and llm is not None:
+    if flagged and llm is not None:
         try:
-            revised = llm.invoke(_revision_prompt(decision, initial["unsupported"], state)).content
+            revised = llm.invoke(_revision_prompt(decision, flagged, state)).content
         except Exception as exc:  # noqa: BLE001 — a failed revision keeps the original, flagged
             logger.warning("fact check: revision failed (%s); keeping the original decision", exc)
             revised = ""
@@ -302,8 +364,10 @@ def check_decision(decision: str, state: Mapping[str, Any], llm: Any | None) -> 
             decision = revised.strip()
             result["revised"] = True
             final = classify_claims(decision, sheet, references)
+            option = check_option(decision, state)
 
     result["call_after"] = parse_rating(decision)
+    result["option"] = option
     result["final"] = final
     return decision + _footer(result), result
 

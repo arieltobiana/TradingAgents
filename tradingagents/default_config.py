@@ -17,6 +17,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_FACT_CHECK":           "fact_check_enabled",
+    "TRADINGAGENTS_OPTION_QUESTION":      "option_question",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
@@ -112,6 +113,9 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Compute a fact sheet in code at run start, show it to every agent, and
     # check the final decision's percentages and multiples against it.
     "fact_check_enabled": True,
+    # "call" or "put": ask which contract on that side to buy, if any. Adds the
+    # options section (quotes, greeks, events) to the fact sheet. None = off.
+    "option_question": None,
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
     "output_language": "English",

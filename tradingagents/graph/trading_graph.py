@@ -153,6 +153,7 @@ class TradingAgentsGraph:
             f"risk={self.config['max_risk_discuss_rounds']}",
             f"asset={asset_type}",
             f"fact_check={bool(self.config.get('fact_check_enabled', True))}",
+            f"option={self.config.get('option_question') or 'none'}",
             # None, an empty book and a changed book are three different runs.
             f"portfolio={portfolio.fingerprint() if portfolio is not None else 'none'}",
         ])
@@ -279,7 +280,18 @@ class TradingAgentsGraph:
             instrument_context=self.resolve_instrument_context(company_name, asset_type, trade_date),
             portfolio_context=portfolio.render(company_name) if portfolio is not None else "",
             fact_sheet=self._fact_sheet(company_name, trade_date, asset_type),
+            option_question=self._option_question(),
         )
+
+    def _option_question(self) -> str | None:
+        """'call' / 'put' when this run asks which contract to buy; validated."""
+        value = self.config.get("option_question")
+        if not value:
+            return None
+        value = str(value).strip().lower()
+        if value not in ("call", "put"):
+            raise ValueError(f"option_question must be 'call' or 'put', got {value!r}")
+        return value
 
     def _fact_sheet(self, company_name, trade_date, asset_type) -> dict:
         """The run's code-computed facts, or {} when disabled (never raises)."""
@@ -288,7 +300,9 @@ class TradingAgentsGraph:
         if not self.config.get("fact_check_enabled", True) or getattr(self, "_resuming", False):
             return {}
         with run_config(self.config):
-            return build_fact_sheet(company_name, str(trade_date), asset_type)
+            return build_fact_sheet(company_name, str(trade_date), asset_type,
+                                    option_right=self._option_question(),
+                                    cache_dir=self.config.get("data_cache_dir"))
 
     def settle_pending(self, company_name):
         """Settle this ticker's decisions whose holding window has now traded.

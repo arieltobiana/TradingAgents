@@ -258,8 +258,29 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional recommended holding period, e.g. '3-6 months'.",
     )
+    option_contract: str | None = Field(
+        default=None,
+        description=(
+            "Only when the run asks which option to buy: the chosen candidate's OCC "
+            "symbol exactly as the fact sheet lists it (e.g. IREN261120C00049000), or "
+            "'none' when no contract should be bought. Leave empty otherwise."
+        ),
+    )
+    option_limit_price: float | None = Field(
+        default=None,
+        description="Only with an option_contract: the most to pay per share, at or below the ask.",
+    )
+    option_plan: str | None = Field(
+        default=None,
+        description=(
+            "Only with an option_contract: size (as a share of what you would put in the "
+            "stock), the exit plan (profit target on the option, a time stop before "
+            "expiry, what to do before earnings) and why this strike and expiry beat "
+            "the other candidates."
+        ),
+    )
 
-    @field_validator("price_target", mode="before")
+    @field_validator("price_target", "option_limit_price", mode="before")
     @classmethod
     def _nullish_float_to_none(cls, v):
         return _coerce_optional_float(v)
@@ -285,6 +306,12 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
     target = decision.price_target if decision.price_target is not None else "not provided"
     parts.extend(["", f"**Price Target**: {target}"])
     parts.extend(["", f"**Time Horizon**: {decision.time_horizon or 'not provided'}"])
+    if decision.option_contract:
+        limit = decision.option_limit_price
+        parts.extend(["", f"**Option**: {decision.option_contract}"
+                      + (f" (limit {limit:.2f} per share)" if limit is not None else "")])
+        if decision.option_plan:
+            parts.extend(["", f"**Option Plan**: {decision.option_plan}"])
     return "\n".join(parts)
 
 

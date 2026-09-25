@@ -392,13 +392,23 @@ def _calendar_facts(sheet: _Sheet, symbol: str, trade_date: str) -> None:
 
 # ------------------------------------------------------------------ assembly
 
-def build_fact_sheet(symbol: str, trade_date: str, asset_type: str = "stock") -> dict:
-    """Compute the fact sheet. Returns ``{"facts": [Fact dicts], "gaps": [str]}``."""
+def build_fact_sheet(symbol: str, trade_date: str, asset_type: str = "stock",
+                     option_right: str | None = None, cache_dir: str | None = None) -> dict:
+    """Compute the fact sheet. Returns ``{"facts": [Fact dicts], "gaps": [str]}``.
+
+    ``option_right`` ("call" or "put") adds the options section: chain-level
+    volatility and event facts plus a table of candidate contracts on that side.
+    """
     sheet = _Sheet()
     sections = [("price", lambda s, sym, d: _price_facts(s, sym, d, asset_type))]
     if asset_type == "stock":
         sections += [("fundamentals", _fundamental_facts), ("insiders", _insider_facts),
                      ("calendar", _calendar_facts)]
+    if option_right and asset_type == "stock":
+        from tradingagents.dataflows.vendors.options import option_facts
+
+        right = {"call": "C", "put": "P"}[option_right]
+        sections.append(("options", lambda s, sym, d: option_facts(s, sym, d, right, cache_dir)))
     for name, fn in sections:
         try:
             fn(sheet, symbol, trade_date)

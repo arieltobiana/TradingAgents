@@ -15,7 +15,7 @@ from tradingagents.agents.context import (
     get_language_instruction,
     get_portfolio_context_from_state,
 )
-from tradingagents.agents.facts import fact_sheet_block
+from tradingagents.agents.facts import fact_sheet_block, option_task_block
 from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
 from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
@@ -63,6 +63,8 @@ def create_portfolio_manager(llm):
 - Trader's transaction proposal: **{trader_plan}**
 {lessons_line}
 {fact_sheet_block(state)}
+
+{option_task_block(state)}
 
 **Risk Analysts Debate History:**
 {history}

@@ -63,9 +63,13 @@ def _coerce_optional_float(value):
 # a mis-read view would be scored as a call the model never made.
 VIEW_DIRECTIONS = ("up", "down", "flat")
 VIEW_MAX_DAYS = 252  # one trading year; further out is not a view anyone can settle
-# "flat" is a claim that the move stays inside this band, either way. One fixed
-# band keeps the claim and its scoring the same thing across horizons.
-VIEW_FLAT_BAND = 0.02
+# "flat" is a claim that the move stays inside this band, either way: this many
+# of the stock's own standard deviations over the horizon, from the daily
+# volatility of the VIEW_VOL_WINDOW sessions up to the analysis date. A fixed
+# percentage would be too tight for a volatile name over months and too loose
+# for an index over days.
+VIEW_FLAT_SD = 0.5
+VIEW_VOL_WINDOW = 20
 
 
 def _coerce_view_direction(value):
@@ -303,7 +307,9 @@ class PortfolioDecision(BaseModel):
         description=(
             "Where you expect the stock's own price to go over view_horizon_days "
             "trading days from the analysis date: up, down, or flat (a move smaller "
-            f"than {VIEW_FLAT_BAND:.0%} either way). This is a forecast about the stock, independent of "
+            f"than {VIEW_FLAT_SD} of the stock's own standard deviation over that horizon, "
+            f"from its last {VIEW_VOL_WINDOW} sessions' volatility, either way). This is a forecast "
+            "about the stock, independent of "
             "the rating's portfolio framing: a Hold or an Underweight can still "
             "expect up. It is scored against the realized price at that horizon."
         ),

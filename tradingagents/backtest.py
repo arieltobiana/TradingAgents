@@ -17,15 +17,17 @@ cell rather than a position carried forward.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from tradingagents.agents.rating import RATING_REVIEW
-from tradingagents.agents.schemas import VIEW_DIRECTIONS, VIEW_FLAT_BAND, VIEW_MAX_DAYS
+from tradingagents.agents.schemas import VIEW_DIRECTIONS, VIEW_FLAT_SD, VIEW_MAX_DAYS, VIEW_VOL_WINDOW
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.symbols import safe_ticker_component
+from tradingagents.dataflows.vendors.yahoo.market import get_closes
 from tradingagents.decision_log import TradingMemoryLog
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.settlement import fetch_returns, resolve_benchmark
@@ -247,12 +249,36 @@ def parse_view(text: str) -> tuple[str, int] | None:
     return direction, days
 
 
-def _view_hit(direction: str, raw: float) -> bool:
+def flat_band(ticker: str, trade_date: str, days: int) -> float | None:
+    """Half-width of a "flat" call: VIEW_FLAT_SD of the stock's move over ``days``.
+
+    Daily volatility comes from the VIEW_VOL_WINDOW sessions up to and including
+    ``trade_date``, all known when the view was made. None when there are not
+    enough closes to measure it.
+    """
+    start = datetime.strptime(trade_date, "%Y-%m-%d")
+    try:
+        closes = get_closes(ticker, (start - timedelta(days=VIEW_VOL_WINDOW * 2 + 14)).strftime("%Y-%m-%d"),
+                            (start + timedelta(days=1)).strftime("%Y-%m-%d"))
+    except Exception as exc:
+        logger.warning("No volatility for %s on %s: %s", ticker, trade_date, exc)
+        return None
+    closes = [float(c) for c in closes][-(VIEW_VOL_WINDOW + 1):]
+    # A missing close is not dropped: bridging it would count a two-day move as one.
+    if len(closes) < VIEW_VOL_WINDOW + 1 or not all(math.isfinite(c) and c > 0 for c in closes):
+        return None
+    rets = [math.log(b / a) for a, b in zip(closes, closes[1:])]
+    mean = sum(rets) / len(rets)
+    daily = math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1))
+    return VIEW_FLAT_SD * daily * math.sqrt(days)
+
+
+def _view_hit(direction: str, raw: float, band: float | None = None) -> bool:
     if direction == "up":
         return raw > 0
     if direction == "down":
         return raw < 0
-    return abs(raw) < VIEW_FLAT_BAND
+    return abs(raw) < band
 
 
 @dataclass
@@ -281,8 +307,9 @@ class ViewSummary:
         lines.append("")
         lines.append(
             "Each view is measured over the trading days it states, from its analysis "
-            f"date. Flat is right when the stock moved less than {VIEW_FLAT_BAND:.0%} "
-            "either way. Pending views have not traded their horizon yet, or had no prices."
+            f"date. Flat is right when the stock moved less than {VIEW_FLAT_SD} of its own "
+            f"standard deviation over that horizon (from the {VIEW_VOL_WINDOW} sessions before "
+            "the view) either way. Pending views have not traded their horizon yet, or had no prices."
         )
         return "\n".join(lines)
 
@@ -309,7 +336,11 @@ def summarize_views(source: BacktestResult | str | Path, config: dict | None = N
         if raw is None:
             pending += 1  # the horizon has not traded yet, or prices are unreachable
             continue
-        scored.setdefault(direction, []).append((_view_hit(direction, raw), raw, alpha))
+        band = flat_band(ticker, entry["date"], days) if direction == "flat" else None
+        if direction == "flat" and band is None:
+            pending += 1  # no volatility to size the band with; a later run may have it
+            continue
+        scored.setdefault(direction, []).append((_view_hit(direction, raw, band), raw, alpha))
 
     by_direction = {
         d: ViewScore(

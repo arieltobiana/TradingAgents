@@ -30,9 +30,10 @@ decision time rather than the session's last.
 Writes take an flock on ``<SYMBOL>/.lock`` for the duplicate check and write
 through a unique temp file plus ``os.replace``, as ``record_iv`` does.
 
-Run daily after the close (does NOT install itself anywhere)::
+Run daily after the close (does NOT install itself anywhere). Schedule it by
+New York time: 16:30 there, whatever the machine's own clock says::
 
-    # crontab: 30 16 * * 1-5  cd ~/Code/Finance/TradingAgents && .venv/bin/python -m tradingagents.options.archive --file ~/watchlist.txt
+    cd ~/Code/Finance/TradingAgents && .venv/bin/python -m tradingagents.options.archive --file ~/watchlist.txt
 """
 
 from __future__ import annotations

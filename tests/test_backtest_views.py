@@ -44,6 +44,8 @@ def returns(monkeypatch):
         return raw, raw - 0.01, holding_days, "2026-03-01"
 
     monkeypatch.setattr(bt, "fetch_returns", fake)
+    # A 2% flat band for every stock, unless a test sets its own.
+    monkeypatch.setattr(bt, "flat_band", lambda ticker, trade_date, days: 0.02)
     return table, calls
 
 
@@ -116,7 +118,7 @@ def test_each_direction_is_scored_on_its_own_hit_rule(tmp_path, returns):
     assert up.count == 2 and up.hit_rate == 0.5 and round(up.mean_raw, 4) == 0.02
     assert round(up.mean_alpha, 4) == 0.01
     assert down.count == 1 and down.hit_rate == 1.0
-    assert flat.count == 2 and flat.hit_rate == 0.5  # inside the 2% band, then outside it
+    assert flat.count == 2 and flat.hit_rate == 0.5  # inside the (stubbed) 2% band, then outside it
     assert "right 50%" in summary.render()
 
 
@@ -167,3 +169,60 @@ def test_a_decision_without_a_readable_view_is_never_scored(tmp_path, returns):
 def test_a_run_that_wrote_no_log_has_no_views(tmp_path, returns):
     result = bt.BacktestResult(run_id="r", log_path=tmp_path / "missing.md")
     assert summarize_views(result, {}).resolved == 0
+
+
+@pytest.mark.unit
+def test_the_flat_band_is_half_the_stocks_own_move_over_the_horizon(monkeypatch):
+    import math
+
+    import pandas as pd
+
+    # Alternating +1% / -1% log moves: a daily standard deviation of about 1.026%.
+    moves = [0.01 if i % 2 else -0.01 for i in range(40)]
+    closes = pd.Series([100 * math.exp(sum(moves[:i])) for i in range(41)])
+    seen = {}
+
+    def fake_closes(ticker, start, end):
+        seen["window"] = (start, end)
+        return closes
+
+    monkeypatch.setattr(bt, "get_closes", fake_closes)
+    rets = moves[-20:]
+    mean = sum(rets) / 20
+    daily = math.sqrt(sum((r - mean) ** 2 for r in rets) / 19)
+
+    assert bt.flat_band("X", "2026-03-02", 16) == pytest.approx(0.5 * daily * 4)
+    assert seen["window"][1] == "2026-03-03"  # the analysis day's close is included, nothing after it
+
+    monkeypatch.setattr(bt, "get_closes", lambda *a: closes[:10])
+    assert bt.flat_band("X", "2026-03-02", 16) is None
+
+    gap = closes.copy()
+    gap.iloc[-5] = float("nan")  # a missing session inside the window
+    monkeypatch.setattr(bt, "get_closes", lambda *a: gap)
+    assert bt.flat_band("X", "2026-03-02", 16) is None
+
+
+@pytest.mark.unit
+def test_a_flat_view_without_volatility_stays_pending(tmp_path, returns, monkeypatch):
+    table, _ = returns
+    monkeypatch.setattr(bt, "flat_band", lambda *a: None)
+    log = _log(tmp_path, [("A", "2026-01-05", _decision("flat", 5))])
+    table[("A", "2026-01-05")] = 0.0
+
+    summary = summarize_views(log, {})
+
+    assert summary.resolved == 0 and summary.pending == 1
+
+
+@pytest.mark.unit
+def test_a_wide_band_turns_a_big_move_into_a_right_flat_call(tmp_path, returns, monkeypatch):
+    table, _ = returns
+    monkeypatch.setattr(bt, "flat_band", lambda ticker, d, days: 0.10 if ticker == "IREN" else 0.01)
+    log = _log(tmp_path, [("IREN", "2026-01-05", _decision("flat", 60)),
+                          ("SPY", "2026-01-05", _decision("flat", 2))])
+    table.update({("IREN", "2026-01-05"): 0.06, ("SPY", "2026-01-05"): 0.015})
+
+    flat = summarize_views(log, {}).by_direction["flat"]
+
+    assert flat.count == 2 and flat.hit_rate == 0.5  # 6% is flat for IREN; 1.5% is not for SPY

@@ -25,19 +25,21 @@ not today's chain.
 from __future__ import annotations
 
 import csv
+import fcntl
 import logging
 import math
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 import yfinance as yf
 
-from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv, yf_retry
 
@@ -62,6 +64,14 @@ MAX_DELTA_DISAGREEMENT = 0.05
 EARNINGS_HISTORY = 8
 # IV rank needs this much saved history before it is reported at all.
 IV_RANK_MIN_DAYS = 60
+
+NY = ZoneInfo("America/New_York")
+
+
+def ny_today() -> str:
+    """Today on the US market's calendar: option expiries and sessions are New York dates."""
+    return datetime.now(NY).strftime("%Y-%m-%d")
+
 
 _OCC = re.compile(r"^(?P<root>[A-Z.]{1,6})(?P<y>\d{2})(?P<m>\d{2})(?P<d>\d{2})(?P<right>[CP])(?P<strike>\d{8})$")
 
@@ -131,8 +141,12 @@ def fetch_cboe(symbol: str) -> tuple[dict, list[Quote]]:
                             _num(o.get("ask")) or 0.0, _num(o.get("iv")), _num(o.get("delta")),
                             _num(o.get("gamma")), _num(o.get("theta")), _num(o.get("vega")),
                             _num(o.get("open_interest")), _num(o.get("volume"))))
+    last_trade = str(data.get("last_trade_time") or "")[:10]
     meta = {"source": "Cboe delayed quotes", "as_of": payload.get("timestamp"),
-            "spot": _num(data.get("current_price")), "iv30": _num(data.get("iv30"))}
+            "spot": _num(data.get("current_price")), "iv30": _num(data.get("iv30")),
+            # The session the quotes describe: before the open that is the
+            # previous session, whatever the calendar date is.
+            "session": last_trade or None}
     return meta, quotes
 
 
@@ -183,28 +197,34 @@ def fetch_alpaca(symbol: str, symbols: list[str] | None = None) -> list[Quote]:
 # ----------------------------------------------------------- earnings dates
 
 def earnings_events(symbol: str) -> list[tuple[pd.Timestamp, str]]:
-    """(report time, 'before open' | 'after close' | 'during session') newest first."""
+    """(report time, 'before open' | 'after close' | 'time not confirmed') newest first."""
     frame = yf_retry(lambda: yf.Ticker(normalize_symbol(symbol)).get_earnings_dates(limit=EARNINGS_HISTORY + 4))
     out = []
     for ts in (frame.index if frame is not None else []):
         ts = pd.Timestamp(ts)
-        hour = ts.tz_convert("America/New_York").hour if ts.tzinfo else ts.hour
+        local = ts.tz_convert(NY) if ts.tzinfo else ts
+        minutes = local.hour * 60 + local.minute
         # The vendor writes a placeholder mid-session time when the report's
         # timing is not confirmed; say so rather than invent a session.
-        when = "before open" if hour < 9 else "after close" if hour >= 16 else "time not confirmed"
+        when = ("before open" if minutes < 9 * 60 + 30 else "after close" if minutes >= 16 * 60
+                else "time not confirmed")
         out.append((ts, when))
     return out
 
 
 def earnings_reactions(symbol: str, trade_date: str, events) -> list[tuple[str, float]]:
-    """Close-to-close move on each past report's reaction session, newest first."""
+    """Close-to-close move on each past report's reaction session, newest first.
+
+    A report whose time is not confirmed is skipped: the reaction session could
+    be that day or the next, and guessing measures the wrong day half the time.
+    """
     bars = load_ohlcv(symbol, trade_date, fill_gaps=False).copy()
     bars["Date"] = pd.to_datetime(bars["Date"]).dt.normalize()
     closes = bars.set_index("Date")["Close"].dropna()
     moves = []
     for ts, when in events:
         day = pd.Timestamp(ts.date())
-        if day >= pd.Timestamp(trade_date):
+        if day >= pd.Timestamp(trade_date) or when == "time not confirmed":
             continue
         before = closes[closes.index < day] if when != "after close" else closes[closes.index <= day]
         after = closes[closes.index >= day] if when != "after close" else closes[closes.index > day]
@@ -218,23 +238,44 @@ def earnings_reactions(symbol: str, trade_date: str, events) -> list[tuple[str, 
 
 # ------------------------------------------------------------- IV history
 
-def record_iv(cache_dir: str, symbol: str, day: str, iv30: float | None, spot: float | None) -> list[tuple[str, float]]:
-    """Append today's IV30 (once per day) and return the saved history."""
+def _read_history(path: Path) -> dict[str, float]:
+    rows: dict[str, float] = {}
+    if not path.exists():
+        return rows
+    with path.open(newline="") as f:
+        for r in csv.reader(f):
+            # Skip headers, torn lines and anything else that does not parse:
+            # one bad row must not switch the section off for the ticker.
+            try:
+                day, iv = date.fromisoformat(r[0]).isoformat(), float(r[1])
+            except (ValueError, IndexError):
+                continue
+            if math.isfinite(iv):
+                rows[day] = iv
+    return rows
+
+
+def record_iv(cache_dir: str, symbol: str, session: str, iv30: float | None,
+              spot: float | None) -> list[tuple[str, float]]:
+    """Save ``session``'s IV30 (once per session) and return the history, oldest first.
+
+    Held under an flock and rewritten through a unique temp file, so two runs
+    for one ticker cannot tear the file or write the session twice.
+    """
     path = Path(cache_dir) / "options_history" / f"{normalize_symbol(symbol).upper()}.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = []
-    if path.exists():
-        with path.open() as f:
-            rows = [(r["date"], float(r["iv30"])) for r in csv.DictReader(f) if r.get("iv30")]
-    if iv30 is not None and all(d != day for d, _ in rows):
-        new = not path.exists()
-        with path.open("a", newline="") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(["date", "iv30", "spot"])
-            w.writerow([day, iv30, spot if spot is not None else ""])
-        rows.append((day, iv30))
-    return rows
+    with open(path.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        rows = _read_history(path)
+        if iv30 is not None and session not in rows:
+            rows[session] = iv30
+            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+            with os.fdopen(fd, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["date", "iv30"])
+                w.writerows(sorted(rows.items()))
+            os.replace(tmp, path)
+    return sorted(rows.items())
 
 
 # ------------------------------------------------------------ fact building
@@ -262,17 +303,17 @@ def _atm(quotes: list[Quote], spot: float, right: str) -> Quote | None:
 
 def option_facts(sheet, symbol: str, trade_date: str, right: str, cache_dir: str | None) -> None:
     """Add the options section to ``sheet`` (a ``yahoo.facts._Sheet``)."""
-    if trade_date < get_current_date():
+    if trade_date < ny_today():
         sheet.gaps.append("options (quotes and greeks are live-only; not available for a past date)")
         return
-    today = date.fromisoformat(trade_date)
+    today = date.fromisoformat(ny_today())
     try:
         meta, chain = fetch_cboe(symbol)
     except Exception as exc:  # noqa: BLE001 — fall back to the second source
         logger.warning("options: Cboe unavailable for %s (%s); trying Alpaca", symbol, exc)
         chain = fetch_alpaca(symbol)
-        meta = {"source": "Alpaca indicative feed", "as_of": datetime.now().isoformat(timespec="minutes"),
-                "spot": None, "iv30": None}
+        meta = {"source": "Alpaca indicative feed", "as_of": datetime.now(NY).isoformat(timespec="minutes"),
+                "spot": None, "iv30": None, "session": None}
     src = f"{meta['source']}, as of {meta['as_of']}"
 
     close = next((f.value for f in sheet.facts if f.label == "Latest close"), None)
@@ -300,15 +341,22 @@ def option_facts(sheet, symbol: str, trade_date: str, right: str, cache_dir: str
         sheet.add("30-day implied volatility (IV30)", meta["iv30"], "pct", src)
         if hv:
             sheet.add("IV30 vs 20-day realized volatility", meta["iv30"] / hv, "x", src)
-    history = record_iv(os.fspath(cache_dir), symbol, trade_date, meta["iv30"], spot) if cache_dir else None
+    session = meta.get("session") or ny_today()
+    history = record_iv(os.fspath(cache_dir), symbol, session, meta["iv30"], spot) if cache_dir else None
     if history is None:
         sheet.gaps.append("IV rank (no cache directory to save daily IV snapshots in)")
-    elif len(history) >= IV_RANK_MIN_DAYS:
-        ivs = [v for _, v in history[-252:]]  # at most a year of trading days
-        rank = (ivs[-1] - min(ivs)) / (max(ivs) - min(ivs)) * 100 if max(ivs) > min(ivs) else 50.0
-        sheet.add(f"IV rank over {len(ivs)} saved days", rank, "pct", "saved daily IV30 snapshots")
     else:
-        sheet.gaps.append(f"IV rank ({len(history)} of {IV_RANK_MIN_DAYS} daily IV snapshots saved so far)")
+        cutoff = (date.fromisoformat(session) - pd.Timedelta(days=365)).isoformat()
+        year = [(d, v) for d, v in history if d > cutoff]
+        if len(year) >= IV_RANK_MIN_DAYS:
+            ivs = [v for _, v in year]
+            lo, hi, now = min(ivs), max(ivs), year[-1][1]
+            rank = (now - lo) / (hi - lo) * 100 if hi > lo else 50.0
+            sheet.add(f"IV rank over {len(ivs)} saved sessions in the last year", rank, "pct",
+                      "saved daily IV30 snapshots")
+        else:
+            sheet.gaps.append(f"IV rank ({len(year)} of {IV_RANK_MIN_DAYS} daily IV snapshots saved in the "
+                              "last year)")
 
     oi_c = sum(q.open_interest or 0 for q in chain if q.right == "C")
     oi_p = sum(q.open_interest or 0 for q in chain if q.right == "P")
@@ -338,9 +386,14 @@ def option_facts(sheet, symbol: str, trade_date: str, right: str, cache_dir: str
         sheet.gaps.append(f"earnings history ({type(exc).__name__})")
 
     def spans_earnings(expiry: date) -> str:
+        """Whether the report lands while the contract is alive (it expires at that day's close)."""
         if next_report is None:
             return "unknown"
-        return "yes" if next_report[0].date() <= expiry else "no"
+        day, when = next_report[0].date(), next_report[1]
+        if day != expiry:
+            return "yes" if day < expiry else "no"
+        return {"before open": "yes", "after close": "no"}.get(
+            when, "ambiguous (report on the expiry day, time not confirmed)")
 
     # Per-expiry market-implied move and skew.
     by_expiry: dict[date, list[Quote]] = {}
@@ -354,7 +407,8 @@ def option_facts(sheet, symbol: str, trade_date: str, right: str, cache_dir: str
         if call and put and call.strike == put.strike:
             move = (call.mid + put.mid) / spot * 100
             sheet.add(f"Expiry {e} ({dte} days, spans earnings: {spans_earnings(e)}): at-the-money straddle "
-                      "implied move", move, "pct", src)
+                      "as % of spot (the move priced over the WHOLE period to expiry, not the earnings day)",
+                      move, "pct", src)
             sheet.add(f"Expiry {e}: at-the-money IV", (call.iv + put.iv) / 2 * 100, "pct", src)
         if 20 <= dte <= 60:
             c25, p25 = _nearest_delta([q for q in qs if q.right == "C"], 0.25), \
@@ -362,6 +416,8 @@ def option_facts(sheet, symbol: str, trade_date: str, right: str, cache_dir: str
             if c25 and p25:
                 sheet.add(f"Expiry {e}: skew, 25-delta put IV minus 25-delta call IV (vol points)",
                           f"{(p25.iv - c25.iv) * 100:+.1f} vol points", "text", src)
+
+    _earnings_implied_move(sheet, by_expiry, spot, today, spans_earnings, src)
 
     # The candidates: one per (expiry, delta target), liquid ones only.
     candidates, thin = [], 0
@@ -414,6 +470,44 @@ def option_facts(sheet, symbol: str, trade_date: str, right: str, cache_dir: str
             parts.append(cross[q.symbol])
         sheet.add(f"Candidate {q.symbol} ({q.expiry} {q.strike:g}{q.right})",
                   "; ".join(p for p in parts if p), "text", src)
+
+
+def _atm_iv(quotes: list[Quote], spot: float) -> float | None:
+    call, put = _atm(quotes, spot, "C"), _atm(quotes, spot, "P")
+    if call and put and call.strike == put.strike:
+        return (call.iv + put.iv) / 2
+    return None
+
+
+def _earnings_implied_move(sheet, by_expiry, spot, today, spans_earnings, src) -> None:
+    """The earnings-day move the options price, from the expiries either side of the report.
+
+    The expiry after the report carries the event's variance on top of the
+    ordinary daily variance; the one before carries only the ordinary. Taking
+    the pre-report IV as the ordinary rate: event variance = T_after x
+    (IV_after^2 - IV_before^2). Comparable with past one-day earnings moves,
+    unlike a whole-period straddle.
+    """
+    order = sorted(by_expiry)
+    before = [e for e in order if spans_earnings(e) == "no"]
+    after = [e for e in order if spans_earnings(e) == "yes"]
+    if not before or not after:
+        return
+    e1, e2 = before[-1], after[0]
+    iv1, iv2 = _atm_iv(by_expiry[e1], spot), _atm_iv(by_expiry[e2], spot)
+    if iv1 is None or iv2 is None:
+        sheet.gaps.append("earnings move implied by options (no at-the-money pair either side of the report)")
+        return
+    event_var = (e2 - today).days / 365 * (iv2 ** 2 - iv1 ** 2)
+    if event_var <= 0:
+        sheet.add("Earnings move implied by options", f"none detectable: IV for {e2} is not above IV for {e1}",
+                  "text", src)
+        return
+    sd = math.sqrt(event_var) * 100
+    sheet.add(f"Earnings-day move implied by options, 1 standard deviation ({e1} vs {e2} at-the-money IV)",
+              sd, "pct", src)
+    sheet.add("Earnings-day move implied by options, expected absolute size (0.8 x 1 standard deviation; "
+              "compare with past average absolute earnings-day move)", sd * math.sqrt(2 / math.pi), "pct", src)
 
 
 def _cross_check(candidates: list[Quote]) -> dict[str, str] | None:

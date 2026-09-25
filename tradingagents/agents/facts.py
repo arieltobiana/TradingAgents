@@ -84,7 +84,9 @@ Answer with ONE contract from the fact sheet's "Candidate" rows (cite its F id a
 - liquidity: the spread and open interest;
 - whether options are cheap or dear: IV30 against realized volatility, and IV rank when it is available;
 - any row marked SOURCES DISAGREE.
-A {side} is a bet on direction AND timing. If the stock view does not point that way within the contract's life, "none" is the right answer. State the limit price (at or below the ask), the size as a share of what you would put in the stock, the exit plan (a profit target on the option, a time stop before expiry, what to do before earnings), and why this strike and expiry beat the other candidates. The most you can lose is the premium paid."""
+For earnings, compare the "earnings-day move implied by options" with the stock's past earnings-day moves; the per-expiry straddle figures price the WHOLE period, not the report.
+A {side} is a bet on direction AND timing. If the stock view does not point that way within the contract's life, "none" is the right answer. State the limit price (at or below the ask), the size as a share of what you would put in the stock, the exit plan (a profit target on the option, a time stop before expiry, what to do before earnings), and why this strike and expiry beat the other candidates. The most you can lose is the premium paid.
+Put the answer on its own line, exactly: "**Option**: <OCC symbol> (limit <price> per share)" or "**Option**: none"."""
 
 
 def fact_sheet_block(state: Mapping[str, Any]) -> str:
@@ -245,37 +247,57 @@ def unverified_claims(text: str, sheet: Mapping[str, Any] | None, references: It
 
 _REPORT_LIST_LIMIT = 8
 
-_OCC_ANY = re.compile(r"\b[A-Z]{1,6}\d{6}[CP]\d{8}\b")
+# The OCC form, also in the padded OSI spelling ("IREN  261120C00049000").
+_OCC_ANY = re.compile(r"\b([A-Z]{1,6})\s*(\d{6}[CP]\d{8})\b")
 _CANDIDATE = re.compile(r"^Candidate (\S+) ")
-_OPTION_LINE = re.compile(r"\*\*Option\*\*:\s*([^\n]+)")
-_SAYS_NONE = re.compile(r"\bnone\b|\bno (?:call|put)\b|\bdo not buy\b|\bdon't buy\b", re.IGNORECASE)
+_OPTION_LINE = re.compile(r"\*\*Option\*\*:\s*([^\n]*)")
+_LINE_SAYS_NONE = re.compile(r"^\W*(?:none|no (?:call|put)|do not buy|don't buy)\b", re.IGNORECASE)
+_LIMIT = re.compile(r"limit\s*(?:of\s*|at\s*)?\$?(\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+def _occ_symbols(text: str) -> list[str]:
+    return list(dict.fromkeys(a + b for a, b in _OCC_ANY.findall(text)))
 
 
 def check_option(decision: str, state: Mapping[str, Any]) -> dict:
-    """For an option question: is the named contract a real candidate, bought sensibly?"""
+    """For an option question: does the decision name exactly one real candidate, sensibly?
+
+    The answer lives on the "**Option**:" line - one candidate's OCC symbol
+    and a limit, or "none". Symbols elsewhere are discussion; each must still
+    be a real candidate, so an invented contract cannot hide in the prose.
+    """
     side = state.get("option_question")
     if not side:
         return {}
     facts = (state.get("fact_sheet") or {}).get("facts") or []
     candidates = {m.group(1): f for f in facts if (m := _CANDIDATE.match(f["label"]))}
-    line = _OPTION_LINE.search(decision)
-    chosen = _OCC_ANY.findall(line.group(1)) if line else []
-    named = list(dict.fromkeys(_OCC_ANY.findall(decision)))
-    problems = [f"names {sym}, which is not a candidate row in the fact sheet"
-                for sym in named if sym not in candidates]
+    line_match = _OPTION_LINE.search(decision)
+    line = line_match.group(1).strip() if line_match else ""
+    says_none = bool(line_match) and bool(_LINE_SAYS_NONE.search(line))
+    chosen = [] if says_none else _occ_symbols(line)
+    notes, problems = [], []
     if not candidates:
-        problems.append(f"the fact sheet has no {side} candidates, so no contract can be checked")
-    if not chosen and not named and not _SAYS_NONE.search(line.group(1) if line else decision):
-        problems.append(f"names no {side} and does not say that none should be bought")
-    for sym in chosen:
-        fact = candidates.get(sym)
-        limit = re.search(r"limit\s*\$?([\d.]+)", line.group(1)) if line else None
-        ask = re.search(r"ask ([\d.]+)", fact["value"]) if fact else None
-        if limit and ask and float(limit.group(1)) > float(ask.group(1)) * 1.001:
-            problems.append(f"the limit {limit.group(1)} for {sym} is above its ask {ask.group(1)}")
-    return {"question": side, "chosen": chosen or named[:1],
-            "cited": {sym: candidates[sym]["id"] for sym in (chosen or named) if sym in candidates},
-            "problems": problems}
+        # Nothing to choose from (a past date, no usable quotes): "none" is the
+        # only answer, and asking again cannot change that.
+        notes.append(f"the fact sheet has no {side} candidates")
+    problems += [f"names {sym}, which is not a candidate row in the fact sheet"
+                 for sym in _occ_symbols(decision) if sym not in candidates]
+    if not line_match:
+        if candidates:
+            problems.append(f"has no '**Option**:' line naming one {side} (or 'none')")
+    elif not says_none:
+        if len(chosen) != 1:
+            problems.append(f"the Option line must name exactly one {side} or 'none'; it names {len(chosen)}")
+        for sym in chosen[:1]:
+            limit = _LIMIT.search(line)
+            ask = re.search(r"ask (\d+(?:\.\d+)?)", candidates[sym]["value"]) if sym in candidates else None
+            if limit is None:
+                problems.append(f"no limit price is given for {sym}")
+            elif ask and float(limit.group(1)) > float(ask.group(1)) * 1.001:
+                problems.append(f"the limit {limit.group(1)} for {sym} is above its ask {ask.group(1)}")
+    return {"question": side, "none": says_none, "chosen": chosen,
+            "cited": {sym: candidates[sym]["id"] for sym in chosen if sym in candidates},
+            "notes": notes, "problems": problems}
 
 
 def _footer(result: Mapping[str, Any]) -> str:
@@ -298,12 +320,15 @@ def _footer(result: Mapping[str, Any]) -> str:
             lines += [f"  - {r}" for r in final["unsupported"]]
         option = result.get("option") or {}
         if option:
-            if option["chosen"]:
+            if option["none"]:
+                lines.append(f"- Option question ({option['question']}): answered none.")
+            elif option["chosen"]:
                 cited = ", ".join(f"{s} [{option['cited'][s]}]" if s in option["cited"] else s
                                   for s in option["chosen"])
                 lines.append(f"- Option question ({option['question']}): chose {cited}.")
             else:
                 lines.append(f"- Option question ({option['question']}): no contract chosen.")
+            lines += [f"  - note: {n}" for n in option["notes"]]
             lines += [f"  - PROBLEM: {p}" for p in option["problems"]]
         if final["report"]:
             lines.append("- From analyst reports only:")

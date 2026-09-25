@@ -50,9 +50,10 @@ def _chain():
 
 @pytest.fixture
 def market(monkeypatch, tmp_path):
-    monkeypatch.setattr(options, "get_current_date", lambda: TODAY)
+    monkeypatch.setattr(options, "ny_today", lambda: TODAY)
     monkeypatch.setattr(options, "fetch_cboe", lambda s: (
-        {"source": "Cboe delayed quotes", "as_of": f"{TODAY} 03:44", "spot": SPOT, "iv30": 76.0}, _chain()))
+        {"source": "Cboe delayed quotes", "as_of": f"{TODAY} 03:44", "spot": SPOT, "iv30": 76.0,
+         "session": "2026-09-24"}, _chain()))
     report = pd.Timestamp("2026-11-05 16:00", tz="America/New_York")
     past = [(pd.Timestamp(d, tz="America/New_York"), "after close") for d in ("2026-08-27 16:00", "2026-05-08 16:00")]
     monkeypatch.setattr(options, "earnings_events", lambda s: [(report, "after close")] + past)
@@ -110,6 +111,7 @@ def test_chain_level_volatility_and_earnings_facts(market):
     assert labels["Next earnings report"].value == "2026-11-05 (after close)"
     assert labels["Average absolute earnings-day move, last 2 reports"].value == pytest.approx(10.1)
     assert any(label.startswith("Expiry 2026-11-20 (56 days, spans earnings: yes)") for label in labels)
+    assert any("WHOLE period" in label for label in labels)
 
 
 @pytest.mark.unit
@@ -126,11 +128,29 @@ def test_iv_rank_waits_for_enough_saved_history(market):
     assert any(g.startswith("IV rank (1 of 60") for g in sheet.gaps)
 
     path = market / "options_history" / "IREN.csv"
-    rows = [f"2026-0{1 + i // 28}-{1 + i % 28:02d},{50 + i},{SPOT}" for i in range(70)]
-    path.write_text("date,iv30,spot\n" + "\n".join(rows) + "\n")
+    start = date(2026, 6, 1)
+    rows = [f"{start + timedelta(days=i)},{50 + i}" for i in range(70)]
+    stale = [f"{date(2025, 1, 1) + timedelta(days=i)},{500 + i}" for i in range(70)]  # over a year old
+    path.write_text("date,iv30\n" + "\n".join(stale + rows) + "\n")
     sheet = _sheet(market)
     rank = next(f for f in sheet.facts if f.label.startswith("IV rank over"))
-    assert 0 <= rank.value <= 100
+    # 76.0 against this year's 50..119, not against last year's 500s.
+    assert rank.label.startswith("IV rank over 71 saved sessions")
+    assert rank.value == pytest.approx((76 - 50) / (119 - 50) * 100)
+
+
+@pytest.mark.unit
+def test_a_damaged_history_file_is_read_around_and_rewritten_clean(market):
+    path = market / "options_history" / "IREN.csv"
+    path.parent.mkdir(parents=True)
+    # Two headers (two first runs racing), a torn line, a duplicate session.
+    path.write_text("date,iv30,spot\ndate,iv30,spot\n2026-09-20,70.0,46\n2026-09-2\n2026-09-20,71.0,46\n")
+
+    history = options.record_iv(str(market), "IREN", "2026-09-24", 76.0, SPOT)
+
+    assert history == [("2026-09-20", 71.0), ("2026-09-24", 76.0)]
+    assert options.record_iv(str(market), "IREN", "2026-09-24", 99.0, SPOT)[-1] == ("2026-09-24", 76.0)
+    assert path.read_text().splitlines()[0] == "date,iv30"
 
 
 @pytest.mark.unit
@@ -156,6 +176,53 @@ def test_an_unreachable_second_source_is_a_gap(market, monkeypatch):
     assert any(g.startswith("second-source cross-check") for g in sheet.gaps)
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("when, spans", [
+    ("before open", "yes"), ("after close", "no"), ("time not confirmed", "ambiguous"),
+])
+def test_a_report_on_the_expiry_day_spans_it_only_if_it_comes_before_the_close(market, monkeypatch, when, spans):
+    expiry = date(2026, 10, 16)  # one of the chain's expiries (21 days out)
+    monkeypatch.setattr(options, "earnings_events",
+                        lambda s: [(pd.Timestamp(f"{expiry} 12:00", tz="America/New_York"), when)])
+    sheet = _sheet(market)
+    label = next(f.label for f in sheet.facts if f.label.startswith(f"Expiry {expiry}") and "straddle" in f.label)
+
+    assert f"spans earnings: {spans}" in label
+
+
+@pytest.mark.unit
+def test_earnings_reactions_measure_the_right_session_and_skip_unconfirmed(monkeypatch):
+    days = pd.bdate_range("2026-08-24", "2026-09-04")
+    closes = pd.DataFrame({"Date": days, "Close": [100.0 + i for i in range(len(days))]})
+    monkeypatch.setattr(options, "load_ohlcv", lambda *a, **k: closes.copy())
+    ny = "America/New_York"
+    events = [(pd.Timestamp("2026-08-27 16:00", tz=ny), "after close"),     # 27th close -> 28th close
+              (pd.Timestamp("2026-09-01 07:00", tz=ny), "before open"),     # 31st close -> 1st close
+              (pd.Timestamp("2026-09-02 15:00", tz=ny), "time not confirmed")]
+
+    got = dict(options.earnings_reactions("IREN", "2026-09-10", events))
+
+    close = dict(zip(closes["Date"].dt.strftime("%Y-%m-%d"), closes["Close"], strict=True))
+    assert got["2026-08-27"] == pytest.approx((close["2026-08-28"] / close["2026-08-27"] - 1) * 100)
+    assert got["2026-09-01"] == pytest.approx((close["2026-09-01"] / close["2026-08-31"] - 1) * 100)
+    assert "2026-09-02" not in got
+
+
+@pytest.mark.unit
+def test_the_earnings_day_move_is_backed_out_of_the_term_structure(market, monkeypatch):
+    today = date.fromisoformat(TODAY)
+    pre, post = today + timedelta(days=21), today + timedelta(days=56)
+    chain = [_q(pre, "C", 46, 3.0, 3.1, iv=0.70), _q(pre, "P", 46, 3.0, 3.1, iv=0.70),
+             _q(post, "C", 46, 5.0, 5.2, iv=0.85), _q(post, "P", 46, 5.0, 5.2, iv=0.85)]
+    monkeypatch.setattr(options, "fetch_cboe", lambda s: (
+        {"source": "Cboe delayed quotes", "as_of": TODAY, "spot": SPOT, "iv30": 76.0, "session": TODAY}, chain))
+    facts = {f.label: f for f in _sheet(market).facts}
+
+    sd = next(f for label, f in facts.items() if label.startswith("Earnings-day move implied by options, 1 standard"))
+    import math
+    assert sd.value == pytest.approx(math.sqrt(56 / 365 * (0.85 ** 2 - 0.70 ** 2)) * 100)
+
+
 # ------------------------------------------------------------ decision side
 
 def _state(tmp_path, question="call"):
@@ -176,7 +243,7 @@ def test_a_chosen_candidate_passes_and_is_cited(market):
     sym = row["label"].split()[1]
     ask = float(row["value"].split("ask ")[1].split(")")[0])
 
-    got = check_option(f"**Option**: {sym} (limit {ask:.2f} per share)", state)
+    got = check_option(f"**Option**: {sym}, limit ${ask:.2f}.", state)   # a trailing period, too
 
     assert got["problems"] == [] and got["cited"] == {sym: row["id"]}
 
@@ -184,7 +251,10 @@ def test_a_chosen_candidate_passes_and_is_cited(market):
 @pytest.mark.unit
 @pytest.mark.parametrize("text, problem", [
     ("**Option**: IREN261120C00099000 (limit 1.00 per share)", "not a candidate"),
-    ("Buy some calls.", "names no call"),
+    ("Buy some calls.", "has no '**Option**:' line"),
+    # "none" in prose is not an answer, and a padded symbol is still read.
+    ("None of the risks look binding. Buy the IREN  261120C00099000 at 9.", "not a candidate"),
+    ("**Option**: IREN261120C00049000", "no limit price"),
 ])
 def test_an_invented_contract_or_no_answer_is_a_problem(market, text, problem):
     got = check_option(text, _state(market))
@@ -204,7 +274,23 @@ def test_a_limit_above_the_ask_is_a_problem(market):
 
 @pytest.mark.unit
 def test_saying_none_is_an_answer(market):
-    assert check_option("**Option**: none — the stock view is Underweight.", _state(market))["problems"] == []
+    state = _state(market)
+    sym = _row(state, "(2026-11-20 49C)")["label"].split()[1]
+
+    got = check_option(f"**Option**: none — {sym} was too expensive for an Underweight view.", state)
+
+    assert got["problems"] == [] and got["none"] and got["chosen"] == []
+
+
+@pytest.mark.unit
+def test_with_no_candidates_none_is_accepted_without_a_revision():
+    state = {"fact_sheet": {"facts": [{"id": "F1", "label": "Latest close", "value": 46.0, "unit": "price",
+                                       "source": "s", "currency": "USD"}], "gaps": []},
+             "option_question": "call"}
+
+    got = check_option("**Rating**: Hold\n\n**Option**: none", state)
+
+    assert got["problems"] == [] and got["notes"]
 
 
 @pytest.mark.unit
@@ -215,9 +301,9 @@ def test_an_option_problem_triggers_the_revision_and_the_footer_reports_it(marke
     class Reviser:
         def invoke(self, prompt):
             assert "OPTION:" in prompt and "THE QUESTION FOR THIS RUN" in prompt
-            return type("R", (), {"content": f"**Rating**: Buy\n\n**Option**: {good}"})()
+            return type("R", (), {"content": f"**Rating**: Buy\n\n**Option**: {good} (limit 2.00 per share)"})()
 
-    text, result = check_decision("**Rating**: Buy\n\n**Option**: IREN261120C00099000", state, Reviser())
+    text, result = check_decision("**Rating**: Buy\n\n**Option**: IREN261120C00099000 (limit 1.00)", state, Reviser())
 
     assert result["revised"] and result["option"]["problems"] == []
     assert f"chose {good}" in text and parse_rating(text) == "Buy"

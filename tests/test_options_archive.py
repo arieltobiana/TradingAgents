@@ -44,18 +44,46 @@ def test_every_field_round_trips_and_the_quotes_are_labelled_not_executable(tmp_
 
 @pytest.mark.unit
 def test_an_exact_duplicate_is_kept_once_with_its_first_fetch_time(tmp_path):
-    first = record_chain_snapshot(str(tmp_path), "IREN", META, _quotes(), fetched_at=_at("2026-09-24", 16, 30))
+    # All during the session: after the close, a later fetch is skipped for another reason.
+    first = record_chain_snapshot(str(tmp_path), "IREN", META, _quotes(), fetched_at=_at("2026-09-24", 14, 30))
     again = record_chain_snapshot(str(tmp_path), "IREN", META, list(reversed(_quotes())),
-                                  fetched_at=_at("2026-09-24", 17, 0))
+                                  fetched_at=_at("2026-09-24", 15, 0))
     assert again == first and len(list_snapshots(str(tmp_path), "IREN")) == 1
     # A changed quote is a new snapshot, even under the same source timestamp.
-    record_chain_snapshot(str(tmp_path), "IREN", META, _quotes(bid=1.12), fetched_at=_at("2026-09-24", 17, 0))
+    record_chain_snapshot(str(tmp_path), "IREN", META, _quotes(bid=1.12), fetched_at=_at("2026-09-24", 15, 0))
     assert len(list_snapshots(str(tmp_path), "IREN")) == 2
     # So is a moved underlying on an unchanged chain: dedup must not keep the old spot.
     record_chain_snapshot(str(tmp_path), "IREN", {**META, "spot": 46.5}, _quotes(bid=1.12),
-                          fetched_at=_at("2026-09-24", 17, 30))
+                          fetched_at=_at("2026-09-24", 15, 30))
     assert len(list_snapshots(str(tmp_path), "IREN")) == 3
-    assert load_chain_snapshot(str(tmp_path), "IREN", _at("2026-09-24", 18))[0]["spot"] == 46.5
+    assert load_chain_snapshot(str(tmp_path), "IREN", _at("2026-09-24", 15, 45))[0]["spot"] == 46.5
+
+
+@pytest.mark.unit
+def test_a_closed_session_is_saved_once_however_often_it_is_fetched(tmp_path):
+    # Intraday fetches of a live session are all kept.
+    record_chain_snapshot(str(tmp_path), "IREN", {**META, "as_of": "a"}, _quotes(bid=1.00),
+                          fetched_at=_at("2026-09-24", 11))
+    record_chain_snapshot(str(tmp_path), "IREN", {**META, "as_of": "b"}, _quotes(bid=1.05),
+                          fetched_at=_at("2026-09-24", 15, 45))
+    final = record_chain_snapshot(str(tmp_path), "IREN", {**META, "as_of": "c"}, _quotes(bid=1.10),
+                                  fetched_at=_at("2026-09-24", 16, 30))
+    assert len(list_snapshots(str(tmp_path), "IREN")) == 3
+    # Later fetches of the same, closed session (a re-stamped payload overnight or
+    # on Saturday) return the final snapshot and write nothing.
+    for when in (_at("2026-09-24", 23, 30), _at("2026-09-26", 7)):
+        again = record_chain_snapshot(str(tmp_path), "IREN", {**META, "as_of": "d"}, _quotes(bid=1.10),
+                                      fetched_at=when)
+        assert again == final
+    assert len(list_snapshots(str(tmp_path), "IREN")) == 3
+    # The next session, and a feed that names no session, are still saved.
+    record_chain_snapshot(str(tmp_path), "IREN", {**META, "session": "2026-09-25"}, _quotes(),
+                          fetched_at=_at("2026-09-25", 16, 30))
+    record_chain_snapshot(str(tmp_path), "IREN", {"source": "Alpaca indicative feed", "as_of": "x",
+                                                   "session": None}, _quotes(), fetched_at=_at("2026-09-26", 7))
+    record_chain_snapshot(str(tmp_path), "IREN", {"source": "Alpaca indicative feed", "as_of": "y",
+                                                   "session": None}, _quotes(bid=1.2), fetched_at=_at("2026-09-26", 8))
+    assert len(list_snapshots(str(tmp_path), "IREN")) == 6
 
 
 @pytest.mark.unit

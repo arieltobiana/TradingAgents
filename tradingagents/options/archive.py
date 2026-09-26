@@ -49,7 +49,7 @@ import os
 import re
 import sys
 import tempfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -65,6 +65,10 @@ DEFAULT_MAX_AGE = timedelta(days=4)
 NOT_EXECUTABLE_NOTE = ("delayed/indicative bid-ask quotes, not executable prices: use them to choose a "
                        "contract, never as the price a fill happened at")
 _STAMP = "%Y%m%dT%H%M%S%fZ"
+# Options stop trading at 16:00 New York (a few ETFs at 16:15), and the delayed
+# feed trails by 15 minutes, so a fetch from this time on holds the session's
+# final quotes. Any later fetch describing the same session repeats them.
+SESSION_FINAL = time(16, 30)
 _NAME = re.compile(r"^(?P<stamp>\d{8}T\d{12}Z)-(?P<feed>[a-z]+)-(?P<digest>[0-9a-f]{16})\.json\.gz$")
 
 
@@ -102,7 +106,10 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 def record_chain_snapshot(cache_dir: str, symbol: str, meta: dict, quotes: list[Quote],
                           fetched_at: datetime | None = None) -> Path:
-    """Archive one fetched chain; returns its file (the existing one for an exact duplicate).
+    """Archive one fetched chain; returns its file (the existing one when nothing is new).
+
+    Nothing is written for an exact duplicate, or for a session whose final
+    (after-close) quotes are already archived.
 
     ``meta`` is what ``fetch_cboe``/``fetch_chain`` return: source, as_of,
     spot, iv30, session and optionally feed. ``fetched_at`` defaults to now.
@@ -121,6 +128,9 @@ def record_chain_snapshot(cache_dir: str, symbol: str, meta: dict, quotes: list[
         existing = sorted(root.glob(f"*/*-{digest}.json.gz"))
         if existing:
             return existing[0]
+        final = _final_snapshot(root, meta.get("session"), feed)
+        if final is not None:
+            return final
         record = {
             "meta": {
                 "schema": SCHEMA_VERSION,
@@ -144,6 +154,31 @@ def record_chain_snapshot(cache_dir: str, symbol: str, meta: dict, quotes: list[
         path = day / f"{fetched.strftime(_STAMP)}-{feed}-{digest}.json.gz"
         _write_atomic(path, gzip.compress(json.dumps(record, sort_keys=True).encode()))
     return path
+
+
+def _final_snapshot(root: Path, session: str | None, feed: str) -> Path | None:
+    """The first snapshot of ``session`` fetched after it closed, if one is archived.
+
+    A closed session's quotes no longer change, so a weekend or overnight fetch
+    of it would only save the same day again under a later fetch time; replay
+    would then count that day twice. Caller holds the symbol's lock.
+    """
+    try:
+        cutoff = datetime.combine(date.fromisoformat(str(session)), SESSION_FINAL, NY).astimezone(timezone.utc)
+    except ValueError:
+        return None  # no session named (Alpaca): nothing to compare against
+    for path in sorted(root.glob("*/*.json.gz")):
+        m = _NAME.match(path.name)
+        if not m or m["feed"] != feed:
+            continue
+        if datetime.strptime(m["stamp"], _STAMP).replace(tzinfo=timezone.utc) < cutoff:
+            continue
+        try:
+            if json.loads(gzip.decompress(path.read_bytes()))["meta"].get("session") == session:
+                return path
+        except (OSError, ValueError, KeyError):
+            continue
+    return None
 
 
 def record_candidates(snapshot: Path, right: str, trade_date: str, contracts: list[str],

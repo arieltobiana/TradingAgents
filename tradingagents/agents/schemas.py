@@ -68,7 +68,7 @@ VIEW_MAX_DAYS = 252  # one trading year; further out is not a view anyone can se
 # volatility of the VIEW_VOL_WINDOW sessions up to the analysis date. A fixed
 # percentage would be too tight for a volatile name over months and too loose
 # for an index over days.
-VIEW_FLAT_SD = 0.5
+VIEW_FLAT_SD = 0.2
 VIEW_VOL_WINDOW = 20
 
 

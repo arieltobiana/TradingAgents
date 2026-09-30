@@ -181,7 +181,10 @@ def run_backtest(
     return result
 
 
-def _log_entries(source: BacktestResult | str | Path) -> list[dict]:
+def _log_entries(source) -> list[dict]:
+    """Entries of one log, or of several (a list of results or paths) joined together."""
+    if isinstance(source, (list, tuple)):
+        return [e for one in source for e in _log_entries(one)]
     if isinstance(source, BacktestResult):
         path = source.log_path      # a run whose cells all failed wrote no log: nothing to score
     elif Path(source).is_file():
@@ -249,28 +252,44 @@ def parse_view(text: str) -> tuple[str, int] | None:
     return direction, days
 
 
-def flat_band(ticker: str, trade_date: str, days: int) -> float | None:
-    """Half-width of a "flat" call: VIEW_FLAT_SD of the stock's move over ``days``.
+def _recent_closes(ticker: str, trade_date: str) -> list[float] | None:
+    """The VIEW_VOL_WINDOW + 1 closes up to and including ``trade_date``, or None.
 
-    Daily volatility comes from the VIEW_VOL_WINDOW sessions up to and including
-    ``trade_date``, all known when the view was made. None when there are not
-    enough closes to measure it.
+    All known when the view was made. A missing close is not dropped: bridging
+    it would count a two-day move as one.
     """
     start = datetime.strptime(trade_date, "%Y-%m-%d")
     try:
         closes = get_closes(ticker, (start - timedelta(days=VIEW_VOL_WINDOW * 2 + 14)).strftime("%Y-%m-%d"),
                             (start + timedelta(days=1)).strftime("%Y-%m-%d"))
     except Exception as exc:
-        logger.warning("No volatility for %s on %s: %s", ticker, trade_date, exc)
+        logger.warning("No recent closes for %s on %s: %s", ticker, trade_date, exc)
         return None
     closes = [float(c) for c in closes][-(VIEW_VOL_WINDOW + 1):]
-    # A missing close is not dropped: bridging it would count a two-day move as one.
     if len(closes) < VIEW_VOL_WINDOW + 1 or not all(math.isfinite(c) and c > 0 for c in closes):
+        return None
+    return closes
+
+
+def flat_band(ticker: str, trade_date: str, days: int) -> float | None:
+    """Half-width of a "flat" call: VIEW_FLAT_SD of the stock's move over ``days``.
+
+    Daily volatility comes from the VIEW_VOL_WINDOW sessions up to and including
+    ``trade_date``. None when there are not enough closes to measure it.
+    """
+    closes = _recent_closes(ticker, trade_date)
+    if closes is None:
         return None
     rets = [math.log(b / a) for a, b in zip(closes, closes[1:])]
     mean = sum(rets) / len(rets)
     daily = math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1))
     return VIEW_FLAT_SD * daily * math.sqrt(days)
+
+
+def prior_return(ticker: str, trade_date: str) -> float | None:
+    """The stock's return over the VIEW_VOL_WINDOW sessions up to ``trade_date``: what a momentum rule sees."""
+    closes = _recent_closes(ticker, trade_date)
+    return closes[-1] / closes[0] - 1 if closes else None
 
 
 def _view_hit(direction: str, raw: float, band: float | None = None) -> bool:
@@ -295,6 +314,9 @@ class ViewSummary:
     pending: int
     unscored: int
     by_direction: dict[str, ViewScore]
+    # Up/down calls only (flat makes no direction claim): the model against two
+    # rules that need no model, on the same cells. name -> (cells, hit rate).
+    directional: dict[str, tuple[int, float]] = field(default_factory=dict)
 
     def render(self) -> str:
         lines = [f"Stock views resolved: {self.resolved} · pending: {self.pending}"
@@ -304,6 +326,11 @@ class ViewSummary:
                 f"- {direction}: n={score.count}, right {score.hit_rate:.0%}, "
                 f"mean return {score.mean_raw:+.2%}, mean alpha {score.mean_alpha:+.2%}"
             )
+        if self.directional:
+            lines.append("")
+            lines.append("Up/down calls against rules that need no model, on the same cells:")
+            for name, (n, hit) in self.directional.items():
+                lines.append(f"- {name}: n={n}, right {hit:.0%}")
         lines.append("")
         lines.append(
             "Each view is measured over the trading days it states, from its analysis "
@@ -314,7 +341,7 @@ class ViewSummary:
         return "\n".join(lines)
 
 
-def summarize_views(source: BacktestResult | str | Path, config: dict | None = None) -> ViewSummary:
+def summarize_views(source, config: dict | None = None) -> ViewSummary:
     """Score each decision's stock view against the stock's return at the view's own horizon.
 
     Independent of settlement: a view is scored whether or not its rating has
@@ -323,6 +350,9 @@ def summarize_views(source: BacktestResult | str | Path, config: dict | None = N
     """
     config = config or DEFAULT_CONFIG
     scored: dict[str, list[tuple[bool, float, float]]] = {}
+    ai_hits: list[bool] = []
+    always_up: list[bool] = []
+    momentum: list[bool] = []
     pending = unscored = 0
     for entry in _log_entries(source):
         view = parse_view(entry.get("decision", ""))
@@ -340,7 +370,16 @@ def summarize_views(source: BacktestResult | str | Path, config: dict | None = N
         if direction == "flat" and band is None:
             pending += 1  # no volatility to size the band with; a later run may have it
             continue
-        scored.setdefault(direction, []).append((_view_hit(direction, raw, band), raw, alpha))
+        hit = _view_hit(direction, raw, band)
+        scored.setdefault(direction, []).append((hit, raw, alpha))
+        if direction != "flat":
+            # The three rows share their cells: one with no usable momentum signal
+            # (no history, or a flat last 20 sessions) is left out of all of them.
+            prior = prior_return(ticker, entry["date"])
+            if prior:
+                ai_hits.append(hit)
+                always_up.append(raw > 0)
+                momentum.append((raw > 0) if prior > 0 else (raw < 0))
 
     by_direction = {
         d: ViewScore(
@@ -351,5 +390,11 @@ def summarize_views(source: BacktestResult | str | Path, config: dict | None = N
         )
         for d in VIEW_DIRECTIONS if (rows := scored.get(d))
     }
+    directional = {}
+    if ai_hits:
+        directional = {"the model's up/down calls": (len(ai_hits), sum(ai_hits) / len(ai_hits)),
+                       "always up": (len(always_up), sum(always_up) / len(always_up))}
+        directional["follow the last 20 sessions"] = (len(momentum), sum(momentum) / len(momentum))
     return ViewSummary(resolved=sum(s.count for s in by_direction.values()),
-                       pending=pending, unscored=unscored, by_direction=by_direction)
+                       pending=pending, unscored=unscored, by_direction=by_direction,
+                       directional=directional)

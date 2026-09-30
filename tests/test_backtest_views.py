@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 import tradingagents.backtest as bt
-from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating, render_pm_decision
+from tradingagents.agents.schemas import VIEW_FLAT_SD, PortfolioDecision, PortfolioRating, render_pm_decision
 from tradingagents.backtest import parse_view, summarize_views
 from tradingagents.decision_log import TradingMemoryLog
 
@@ -172,7 +172,7 @@ def test_a_run_that_wrote_no_log_has_no_views(tmp_path, returns):
 
 
 @pytest.mark.unit
-def test_the_flat_band_is_half_the_stocks_own_move_over_the_horizon(monkeypatch):
+def test_the_flat_band_is_a_share_of_the_stocks_own_move_over_the_horizon(monkeypatch):
     import math
 
     import pandas as pd
@@ -191,7 +191,7 @@ def test_the_flat_band_is_half_the_stocks_own_move_over_the_horizon(monkeypatch)
     mean = sum(rets) / 20
     daily = math.sqrt(sum((r - mean) ** 2 for r in rets) / 19)
 
-    assert bt.flat_band("X", "2026-03-02", 16) == pytest.approx(0.5 * daily * 4)
+    assert bt.flat_band("X", "2026-03-02", 16) == pytest.approx(VIEW_FLAT_SD * daily * 4)
     assert seen["window"][1] == "2026-03-03"  # the analysis day's close is included, nothing after it
 
     monkeypatch.setattr(bt, "get_closes", lambda *a: closes[:10])
@@ -226,3 +226,73 @@ def test_a_wide_band_turns_a_big_move_into_a_right_flat_call(tmp_path, returns, 
     flat = summarize_views(log, {}).by_direction["flat"]
 
     assert flat.count == 2 and flat.hit_rate == 0.5  # 6% is flat for IREN; 1.5% is not for SPY
+
+
+@pytest.fixture
+def prior(monkeypatch):
+    """Stub prior_return: ``table[(ticker, date)] = the last 20 sessions' return``."""
+    table: dict = {}
+    monkeypatch.setattr(bt, "prior_return", lambda ticker, d: table.get((ticker, d)))
+    return table
+
+
+@pytest.mark.unit
+def test_up_down_calls_are_scored_against_always_up_and_momentum(tmp_path, returns, prior):
+    table, _ = returns
+    log = _log(tmp_path, [
+        ("A", "2026-01-05", _decision("up", 20)),     # stock rose and had been rising
+        ("B", "2026-01-05", _decision("down", 20)),   # stock rose; had been falling
+        ("C", "2026-01-05", _decision("up", 20)),     # stock fell; had been rising
+        ("D", "2026-01-05", _decision("flat", 20)),   # no direction claimed: not in the comparison
+    ])
+    table.update({("A", "2026-01-05"): 0.05, ("B", "2026-01-05"): 0.04,
+                  ("C", "2026-01-05"): -0.03, ("D", "2026-01-05"): 0.0})
+    prior.update({("A", "2026-01-05"): 0.10, ("B", "2026-01-05"): -0.10, ("C", "2026-01-05"): 0.10})
+
+    d = summarize_views(log, {}).directional
+
+    assert d["the model's up/down calls"] == (3, pytest.approx(1 / 3))   # only A is right
+    assert d["always up"] == (3, pytest.approx(2 / 3))                   # A and B rose
+    assert d["follow the last 20 sessions"] == (3, pytest.approx(1 / 3))  # A right; B, C wrong
+    assert "always up: n=3, right 67%" in summarize_views(log, {}).render()
+
+
+@pytest.mark.unit
+def test_a_cell_without_a_momentum_signal_is_left_out_of_all_three_rows(tmp_path, returns, prior):
+    table, _ = returns
+    log = _log(tmp_path, [("A", "2026-01-05", _decision("up", 5)), ("B", "2026-01-05", _decision("up", 5)),
+                          ("C", "2026-01-05", _decision("up", 5))])
+    table.update({("A", "2026-01-05"): 0.02, ("B", "2026-01-05"): 0.02, ("C", "2026-01-05"): 0.02})
+    prior[("A", "2026-01-05")] = 0.03   # B has no history; C's last 20 sessions were flat
+    prior[("C", "2026-01-05")] = 0.0
+
+    d = summarize_views(log, {}).directional
+
+    assert d == {"the model's up/down calls": (1, 1.0), "always up": (1, 1.0),
+                 "follow the last 20 sessions": (1, 1.0)}
+
+
+@pytest.mark.unit
+def test_several_logs_are_scored_together(tmp_path, returns, prior):
+    table, _ = returns
+    one = TradingMemoryLog({"memory_log_path": str(tmp_path / "one.md")})
+    two = TradingMemoryLog({"memory_log_path": str(tmp_path / "two.md")})
+    one.store_decision("A", "2026-01-05", _decision("up", 20))
+    two.store_decision("B", "2026-01-05", _decision("down", 20))
+    table.update({("A", "2026-01-05"): 0.05, ("B", "2026-01-05"): -0.02})
+    prior.update({("A", "2026-01-05"): 0.01, ("B", "2026-01-05"): 0.01})
+
+    summary = summarize_views([tmp_path / "one.md", tmp_path / "two.md"], {})
+
+    assert summary.resolved == 2 and summary.directional["the model's up/down calls"] == (2, 1.0)
+
+
+@pytest.mark.unit
+def test_prior_return_is_the_move_over_the_window_and_none_without_history(monkeypatch):
+    import pandas as pd
+
+    closes = pd.Series([100.0 + i for i in range(21)])  # 100 -> 120 over 20 sessions
+    monkeypatch.setattr(bt, "get_closes", lambda *a: closes)
+    assert bt.prior_return("X", "2026-03-02") == pytest.approx(0.20)
+    monkeypatch.setattr(bt, "get_closes", lambda *a: closes[:5])
+    assert bt.prior_return("X", "2026-03-02") is None

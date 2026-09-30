@@ -8,7 +8,7 @@ import pytest
 
 from tradingagents.dataflows.vendors.options import Quote
 from tradingagents.options import scenario
-from tradingagents.options.scenario import bs_price, rank_contracts
+from tradingagents.options.scenario import VOL_DROP, bottom_line, bs_price, rank_contracts, recommend
 
 TODAY = date(2026, 9, 30)
 EXIT = date(2026, 12, 31)
@@ -101,3 +101,63 @@ def test_a_volatility_drop_lowers_every_calls_return():
     b, _ = rank_contracts(_chain(), SPOT, "C", 1100.0, EXIT, TODAY, iv_shift=-0.10)
     base = {r.symbol: r for r in a}
     assert all(r.roi_target < base[r.symbol].roi_target for r in b)
+
+
+def _picks(target, **kw):
+    rows, _ = rank_contracts(_chain(), SPOT, "C", target, EXIT, TODAY, **kw)
+    drop, _ = rank_contracts(_chain(), SPOT, "C", target, EXIT, TODAY, iv_shift=-VOL_DROP, **kw)
+    return rows, drop, recommend(rows, drop)
+
+
+@pytest.mark.unit
+def test_the_pick_makes_money_at_the_target_as_quoted_and_after_a_volatility_drop():
+    rows, drop, picks = _picks(1300.0)
+    assert picks is not None
+    by_drop = {r.symbol: r for r in drop}
+    assert picks.best.roi_target > 0 and by_drop[picks.best.symbol].roi_target > 0
+    assert picks.best_after_drop.symbol == picks.best.symbol
+    # nothing that qualifies averages better over right / half right / flat after the drop
+    avg = lambda r: (r.roi_target + r.roi_half + r.roi_flat) / 3
+    qualifying = [r for r in rows if r.roi_target > 0 and by_drop[r.symbol].roi_target > 0]
+    assert all(avg(by_drop[r.symbol]) <= avg(picks.best_after_drop) + 1e-12 for r in qualifying)
+    assert picks.qualifying == len(qualifying)
+
+
+@pytest.mark.unit
+def test_a_target_too_small_to_pay_for_the_premium_gets_no_pick_and_says_so():
+    _, _, picks = _picks(1020.0)
+    assert picks is None
+    text = bottom_line(None, "X", "C", SPOT, 1020.0, EXIT)
+    assert "No call" in text and "buy shares" in text
+
+
+@pytest.mark.unit
+def test_the_leverage_pick_is_a_different_contract_with_more_return_at_the_target():
+    _, drop, picks = _picks(1300.0)
+    if picks.leverage is not None:
+        assert picks.leverage.symbol != picks.best.symbol
+        assert picks.leverage_after_drop.roi_target >= picks.best_after_drop.roi_target
+
+
+@pytest.mark.unit
+def test_a_budget_removes_dearer_contracts_and_the_pick_respects_it():
+    rows, _, picks = _picks(1300.0, budget=5000.0)
+    assert rows and all(r.ask * 100 <= 5000.0 for r in rows) and picks.best.ask * 100 <= 5000.0
+    _, ctx = rank_contracts(_chain(), SPOT, "C", 1300.0, EXIT, TODAY, budget=5000.0)
+    assert ctx["dropped"]["over budget"] > 0
+
+
+@pytest.mark.unit
+def test_the_bottom_line_names_the_pick_and_compares_with_shares():
+    _, _, picks = _picks(1300.0)
+    text = bottom_line(picks, "X", "C", SPOT, 1300.0, EXIT)
+    assert picks.best.symbol in text and "Shares instead: +30.0%" in text and "break-even" in text
+
+
+@pytest.mark.unit
+def test_nothing_within_the_budget_says_so_and_names_the_cheapest_instead_of_blaming_the_target():
+    rows, ctx = rank_contracts(_chain(), SPOT, "C", 1300.0, EXIT, TODAY, budget=1.0)
+    assert rows == [] and ctx["cheapest_over_budget"] > 1.0
+    text = scenario.render(rows, ctx, "X", "C", SPOT, 1300.0, EXIT)
+    assert "within your $1 budget" in text and "the cheapest costs" in text
+    assert "No contract to choose from" in bottom_line(None, "X", "C", SPOT, 1300.0, EXIT, had_candidates=False)

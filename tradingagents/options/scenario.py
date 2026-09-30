@@ -23,6 +23,7 @@ How a contract is valued at the exit date (the target date):
 Usage::
 
     python -m tradingagents.options.scenario MU --target 1200 --by 2026-12-31
+    python -m tradingagents.options.scenario IREN --target 50 --by 2026-12-31 --budget 1500
     python -m tradingagents.options.scenario IREN --put --target 30 --by 2026-11-20
 """
 
@@ -111,10 +112,11 @@ def market_vol(quotes: list[Quote], spot: float, exit_date: date) -> float | Non
 
 
 def rank_contracts(quotes: list[Quote], spot: float, right: str, target: float, exit_date: date,
-                   today: date, iv_shift: float = 0.0, rate: float = RISK_FREE) -> tuple[list[Row], dict]:
+                   today: date, iv_shift: float = 0.0, rate: float = RISK_FREE,
+                   budget: float | None = None) -> tuple[list[Row], dict]:
     """Candidates that survive the liquidity and expiry filters, best expected growth first.
 
-    Returns ``(rows, context)``; ``context`` carries the volatility and horizon the
+    ``budget`` (dollars per contract, ask x 100) drops anything dearer. Returns ``(rows, context)``; ``context`` carries the volatility and horizon the
     distributions used and how many contracts each filter removed.
     """
     horizon = (exit_date - today).days / 365.0
@@ -128,8 +130,9 @@ def rank_contracts(quotes: list[Quote], spot: float, right: str, target: float, 
     w = [x / total for x in w]
 
     dropped = {"wrong side": 0, "expires too soon": 0, "expires too late": 0, "not usable": 0, "wide spread": 0, "thin open interest": 0,
-               "far from spot": 0}
+               "far from spot": 0, "over budget": 0}
     rows: list[Row] = []
+    dearest_cut = math.inf          # the cheapest contract that passed every filter but the budget
     for q in quotes:
         if q.right != right:
             dropped["wrong side"] += 1
@@ -151,6 +154,10 @@ def rank_contracts(quotes: list[Quote], spot: float, right: str, target: float, 
             continue
         if abs(q.strike / spot - 1) > STRIKE_BAND:
             dropped["far from spot"] += 1
+            continue
+        if budget is not None and q.ask * 100 > budget:
+            dropped["over budget"] += 1
+            dearest_cut = min(dearest_cut, q.ask * 100)
             continue
         expiry_years = (q.expiry - today).days / 365.0
         # The contract's own volatility drives the spread of outcomes, so that with no opinion its
@@ -183,12 +190,17 @@ def rank_contracts(quotes: list[Quote], spot: float, right: str, target: float, 
                         stats["view"][2]))
     rows.sort(key=lambda r: r.growth, reverse=True)
     return rows, {"sigma": sigma, "horizon_days": (exit_date - today).days, "s_h": s_mkt,
-                  "dropped": dropped, "iv_shift": iv_shift}
+                  "dropped": dropped, "iv_shift": iv_shift,
+                  "cheapest_over_budget": None if dearest_cut == math.inf else dearest_cut, "budget": budget}
 
 
 def render(rows: list[Row], ctx: dict, symbol: str, right: str, spot: float, target: float,
            exit_date: date, per_expiry: int = 3) -> str:
     if not rows:
+        if ctx.get("cheapest_over_budget"):
+            return (f"{symbol}: nothing within your ${ctx['budget']:,.0f} budget passes the filters "
+                    f"({ctx['dropped']['over budget']} were dearer; the cheapest costs ${ctx['cheapest_over_budget']:,.0f} "
+                    f"a contract).")
         return f"{symbol}: no contract passes the filters ({ctx.get('error') or ctx.get('dropped')})."
     kind = "call" if right == "C" else "put"
     move = target / spot - 1
@@ -215,6 +227,80 @@ def render(rows: list[Row], ctx: dict, symbol: str, right: str, spot: float, tar
     return "\n".join(out)
 
 
+VOL_DROP = 0.10             # the "after the report" case the pick must survive: implied volatility 10 points lower
+
+
+@dataclass
+class Picks:
+    best: Row                     # best average over "you are right", "half right" and "nothing happens"
+    best_after_drop: Row          # the same contract repriced with the volatility drop
+    leverage: Row | None          # more return if you are right, for more risk if you are not
+    leverage_after_drop: Row | None
+    qualifying: int
+
+
+def _average(r: Row) -> float:
+    """One number for how a contract does across the three outcomes that matter: right, half right, nothing."""
+    return (r.roi_target + r.roi_half + r.roi_flat) / 3
+
+
+def recommend(rows: list[Row], rows_after_drop: list[Row]) -> Picks | None:
+    """The contract to buy if the view stands, or None when no contract makes money even when the view is right.
+
+    A contract qualifies only if it returns more than it cost when the stock is exactly at the target
+    on the exit date, both as quoted and after a volatility drop: being right must pay. Everything is
+    judged after the drop, the harder case. The best is the highest equal-weight average of the return
+    at the target, half way there and flat. A cheap far strike can win on expected return alone and
+    still lose most of its cost unless the stock goes all the way; the average stops it winning.
+    The leverage pick is the largest return at the target among contracts with at least even odds of a
+    profit under your view and no worse than -60% if the stock is flat.
+    """
+    drop = {r.symbol: r for r in rows_after_drop}
+    ok = [r for r in rows if r.roi_target > 0 and r.symbol in drop and drop[r.symbol].roi_target > 0]
+    if not ok:
+        return None
+    best = max(ok, key=lambda r: _average(drop[r.symbol]))
+    lev = [r for r in ok if drop[r.symbol].p_profit_view >= 0.5 and drop[r.symbol].roi_flat >= -0.6]
+    lev_pick = max(lev, key=lambda r: drop[r.symbol].roi_target, default=None)
+    if lev_pick is not None and lev_pick.symbol == best.symbol:
+        lev_pick = None
+    return Picks(best, drop[best.symbol], lev_pick, drop[lev_pick.symbol] if lev_pick else None, len(ok))
+
+
+def _line(r: Row, after_drop: Row | None = None) -> str:
+    cost = r.ask * 100
+    text = (f"{r.symbol}  ({r.expiry:%b %Y} ${r.strike:,.0f}): pay {r.ask:,.2f} a share (${cost:,.0f} a contract), "
+            f"break-even {r.breakeven:,.0f}. At the target {r.roi_target:+.0%}")
+    if after_drop is not None:
+        text += f" ({after_drop.roi_target:+.0%} after a volatility drop)"
+    return text + f"; half way {r.roi_half:+.0%}; flat {r.roi_flat:+.0%}; 10% lower {r.roi_down:+.0%}."
+
+
+def bottom_line(picks: Picks | None, symbol: str, right: str, spot: float, target: float, exit_date: date,
+                had_candidates: bool = True) -> str:
+    """The plain-language answer for the view as stated, with the alternatives and the shares comparison."""
+    head = f"BOTTOM LINE - if {target:,.0f} by {exit_date} is still your view:"
+    if picks is None and not had_candidates:
+        return f"{head}\n  No contract to choose from: see the filters above."
+    if picks is None:
+        return (f"{head}\n  No {'call' if right == 'C' else 'put'} both passes the filters and makes money when you are "
+                f"exactly right, even before a volatility drop. The move you expect is too small for the premium the "
+                f"market charges: buy shares, pick a bigger target, or a later exit date.")
+    kind = "call" if right == "C" else "put"
+    out = [head,
+           f"  Best {kind}: " + _line(picks.best, picks.best_after_drop),
+           f"    Why: the best average over 'you are right', 'half right' and 'nothing happens', judged after a "
+           f"volatility drop, among the {picks.qualifying} contracts that still make money if the stock is exactly "
+           f"at the target."]
+    if picks.leverage is not None:
+        out.append("  More leverage, more risk: " + _line(picks.leverage, picks.leverage_after_drop))
+    if right == "C":
+        out.append(f"  Shares instead: {target / spot - 1:+.1%} at the target, 0% flat, -10.0% if 10% lower "
+                   f"(${spot * 100:,.0f} per 100 shares). The {kind} risks less money but can lose all of it.")
+    out.append("  Model estimates on delayed quotes, not prices you can trade; check the live quote before acting.")
+    return "\n".join(out)
+
+
 def main(argv: list[str] | None = None) -> int:
     from tradingagents.dataflows.vendors.options import fetch_chain, ny_today
 
@@ -224,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--by", required=True, help="the date you expect it by, YYYY-MM-DD")
     ap.add_argument("--put", action="store_true", help="bearish: rank puts (default is calls)")
     ap.add_argument("--iv-shift", type=float, default=0.0, help="change in implied volatility by the exit, e.g. -0.15")
+    ap.add_argument("--budget", type=float, default=None, help="most you will pay for one contract, in dollars")
     ap.add_argument("--per-expiry", type=int, default=3, help="contracts shown per expiry")
     args = ap.parse_args(argv)
 
@@ -237,14 +324,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"note: a {'put' if right == 'P' else 'call'} profits from a fall/rise, but the target "
               f"{args.target:,.2f} is {'above' if args.target > spot else 'below'} spot {spot:,.2f}")
     exit_date = date.fromisoformat(args.by)
-    rows, ctx = rank_contracts(quotes, spot, right, args.target, exit_date, date.fromisoformat(ny_today()),
-                               iv_shift=args.iv_shift)
+    today = date.fromisoformat(ny_today())
+    rows, ctx = rank_contracts(quotes, spot, right, args.target, exit_date, today, iv_shift=args.iv_shift,
+                               budget=args.budget)
     print(render(rows, ctx, args.symbol.upper(), right, spot, args.target, exit_date, args.per_expiry))
+    rows_drop, _ = rank_contracts(quotes, spot, right, args.target, exit_date, today,
+                                  iv_shift=args.iv_shift - VOL_DROP, budget=args.budget)
+    print("\n" + bottom_line(recommend(rows, rows_drop), args.symbol.upper(), right, spot, args.target, exit_date,
+                                 had_candidates=bool(rows)))
     try:
         from tradingagents.dataflows.vendors.options import earnings_events
 
         upcoming = [(d.date(), when) for d, when in earnings_events(args.symbol.upper())
-                    if date.fromisoformat(ny_today()) <= d.date() <= exit_date]
+                    if today <= d.date() <= exit_date]
         if upcoming:
             print("\nEarnings before your exit date: " + ", ".join(f"{d} ({when})" for d, when in upcoming)
                   + ". Implied volatility usually falls after the report; try --iv-shift -0.10.")

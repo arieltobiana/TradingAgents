@@ -293,8 +293,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--file", action="append", default=[], help="watchlist file: tickers separated by "
                         "whitespace/commas, '#' comments (repeatable)")
     parser.add_argument("--cache-dir", default=DEFAULT_CONFIG["data_cache_dir"])
+    parser.add_argument("--open-picks", action="store_true",
+                        help="also snapshot every ticker with an option pick still to be scored")
     args = parser.parse_args(argv)
-    symbols = _watchlist(args.symbols, args.file)
+    symbols = list(args.symbols)
+    if args.open_picks:
+        from datetime import date
+
+        from tradingagents.dataflows.vendors.options import ny_today
+        from tradingagents.options.picklog import open_pick_symbols
+
+        symbols += open_pick_symbols(args.cache_dir, date.fromisoformat(ny_today()))
+    symbols = _watchlist(symbols, args.file)
     if not symbols:
         parser.error("no symbols given")
     ok = 0

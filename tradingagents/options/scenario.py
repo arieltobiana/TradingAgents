@@ -22,6 +22,8 @@ How a contract is valued at the exit date (the target date):
 
 Usage::
 
+    opt MU 1200 2026-12-31                      # the short form (same as --target 1200 --by 2026-12-31)
+    opt review                                  # how the logged picks turned out
     python -m tradingagents.options.scenario MU --target 1200 --by 2026-12-31
     python -m tradingagents.options.scenario IREN --target 50 --by 2026-12-31 --budget 1500
     python -m tradingagents.options.scenario IREN --put --target 30 --by 2026-11-20
@@ -119,6 +121,10 @@ def rank_contracts(quotes: list[Quote], spot: float, right: str, target: float, 
     ``budget`` (dollars per contract, ask x 100) drops anything dearer. Returns ``(rows, context)``; ``context`` carries the volatility and horizon the
     distributions used and how many contracts each filter removed.
     """
+    if (right == "C") != (target > spot):
+        side = "above" if right == "C" else "below"
+        return [], {"error": f"a long {'call' if right == 'C' else 'put'} needs a target {side} the price "
+                             f"{spot:,.2f}; {target:,.2f} is on the other side"}
     horizon = (exit_date - today).days / 365.0
     sigma = market_vol(quotes, spot, exit_date)
     if sigma is None or horizon <= 0:
@@ -302,17 +308,31 @@ def bottom_line(picks: Picks | None, symbol: str, right: str, spot: float, targe
 
 
 def main(argv: list[str] | None = None) -> int:
+    import sys
+
     from tradingagents.dataflows.vendors.options import fetch_chain, ny_today
 
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "review":
+        from tradingagents.options import picklog
+
+        return picklog.main(argv)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("symbol")
-    ap.add_argument("--target", type=float, required=True, help="the price you expect")
-    ap.add_argument("--by", required=True, help="the date you expect it by, YYYY-MM-DD")
+    ap.add_argument("target_pos", nargs="?", type=float, metavar="target", help="the price you expect")
+    ap.add_argument("by_pos", nargs="?", metavar="by", help="the date you expect it by, YYYY-MM-DD")
+    ap.add_argument("--target", type=float, help="the price you expect")
+    ap.add_argument("--by", help="the date you expect it by, YYYY-MM-DD")
+    ap.add_argument("--no-log", action="store_true", help="do not record this run in the pick log")
     ap.add_argument("--put", action="store_true", help="bearish: rank puts (default is calls)")
     ap.add_argument("--iv-shift", type=float, default=0.0, help="change in implied volatility by the exit, e.g. -0.15")
     ap.add_argument("--budget", type=float, default=None, help="most you will pay for one contract, in dollars")
     ap.add_argument("--per-expiry", type=int, default=3, help="contracts shown per expiry")
     args = ap.parse_args(argv)
+    args.target = args.target if args.target is not None else args.target_pos
+    args.by = args.by or args.by_pos
+    if args.target is None or not args.by:
+        ap.error("give the target price and the date: opt MU 1200 2026-12-31")
 
     meta, quotes = fetch_chain(args.symbol.upper())
     spot = meta["spot"]
@@ -320,9 +340,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{args.symbol}: the source gave no underlying price")
         return 1
     right = "P" if args.put else "C"
-    if (right == "C") != (args.target > spot):
-        print(f"note: a {'put' if right == 'P' else 'call'} profits from a fall/rise, but the target "
-              f"{args.target:,.2f} is {'above' if args.target > spot else 'below'} spot {spot:,.2f}")
     exit_date = date.fromisoformat(args.by)
     today = date.fromisoformat(ny_today())
     rows, ctx = rank_contracts(quotes, spot, right, args.target, exit_date, today, iv_shift=args.iv_shift,
@@ -330,8 +347,11 @@ def main(argv: list[str] | None = None) -> int:
     print(render(rows, ctx, args.symbol.upper(), right, spot, args.target, exit_date, args.per_expiry))
     rows_drop, _ = rank_contracts(quotes, spot, right, args.target, exit_date, today,
                                   iv_shift=args.iv_shift - VOL_DROP, budget=args.budget)
-    print("\n" + bottom_line(recommend(rows, rows_drop), args.symbol.upper(), right, spot, args.target, exit_date,
-                                 had_candidates=bool(rows)))
+    picks = recommend(rows, rows_drop)
+    print("\n" + bottom_line(picks, args.symbol.upper(), right, spot, args.target, exit_date,
+                             had_candidates=bool(rows)))
+    if not args.no_log:
+        _log_run(args, right, spot, exit_date, meta, quotes, picks, ctx)
     try:
         from tradingagents.dataflows.vendors.options import earnings_events
 
@@ -344,6 +364,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n(earnings dates unavailable: {exc})")
     print(f"\nData: {meta['source']} as of {meta['as_of']} (delayed, not executable prices).")
     return 0
+
+
+def _log_run(args, right: str, spot: float, exit_date: date, meta: dict, quotes: list[Quote], picks, ctx: dict) -> None:
+    """Record the run and the chain it was made from. A failure here is reported, never allowed to hide the ranking."""
+    try:
+        from tradingagents.default_config import DEFAULT_CONFIG
+        from tradingagents.options import picklog
+        from tradingagents.options.archive import record_chain_snapshot
+
+        cache = DEFAULT_CONFIG["data_cache_dir"]
+        snapshot = record_chain_snapshot(cache, args.symbol.upper(), meta, quotes)
+        picklog.record_pick(cache, picklog.make_entry(args.symbol.upper(), right, spot, args.target, exit_date,
+                                                      args.budget, args.iv_shift, meta, picks, ctx, snapshot))
+        print("Logged. Review how your picks turned out with: opt review")
+    except Exception as exc:  # noqa: BLE001
+        print(f"(could not log this run: {type(exc).__name__}: {exc})")
 
 
 if __name__ == "__main__":

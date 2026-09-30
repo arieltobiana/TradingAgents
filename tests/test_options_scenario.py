@@ -37,7 +37,7 @@ def test_put_call_parity_and_intrinsic_at_expiry():
 
 @pytest.mark.unit
 def test_with_no_opinion_the_expected_return_is_about_the_cost_of_the_trade():
-    rows, _ = rank_contracts(_chain(), SPOT, "C", target=1000.0, exit_date=EXIT, today=TODAY)
+    rows, _ = rank_contracts(_chain(), SPOT, "C", target=1001.0, exit_date=EXIT, today=TODAY)
     assert rows
     for r in rows:
         # getting in at the ask and out below the model value costs roughly the spread, never a gain or a disaster
@@ -161,3 +161,14 @@ def test_nothing_within_the_budget_says_so_and_names_the_cheapest_instead_of_bla
     text = scenario.render(rows, ctx, "X", "C", SPOT, 1300.0, EXIT)
     assert "within your $1 budget" in text and "the cheapest costs" in text
     assert "No contract to choose from" in bottom_line(None, "X", "C", SPOT, 1300.0, EXIT, had_candidates=False)
+
+
+@pytest.mark.unit
+def test_a_target_on_the_wrong_side_of_the_price_is_refused_not_ranked():
+    rows, ctx = rank_contracts(_chain(), SPOT, "C", target=900.0, exit_date=EXIT, today=TODAY)
+    assert rows == [] and "needs a target above" in ctx["error"]
+    puts = [_quote(k, date(2027, 3, 19), "P") for k in (900, 1000, 1100)]
+    rows, ctx = rank_contracts(puts, SPOT, "P", target=1200.0, exit_date=EXIT, today=TODAY)
+    assert rows == [] and "needs a target below" in ctx["error"]
+    assert "needs a target above" in scenario.render([], {"error": ctx["error"].replace("below", "above")},
+                                                     "X", "C", SPOT, 900.0, EXIT)

@@ -31,7 +31,7 @@ import os
 import re
 import statistics
 import tempfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -172,6 +172,11 @@ class Outcome:
     stock_at_exit: float | None = None
     predicted_at_target: float | None = None
     reason: str = ""
+    strike: float | None = None
+    expiry: str | None = None
+    breakeven: float | None = None
+    spot_at_pick: float | None = None
+    as_of: str | None = None            # when the quotes behind the pick were made, per the source
 
 
 def _quote_bid(quotes, symbol: str) -> float | None:
@@ -188,7 +193,9 @@ def score(row: dict, cache_dir: str, today: date) -> Outcome | None:
         return None
     exit_d = date.fromisoformat(row["exit_date"])
     out = Outcome(row["logged_at"][:10], row["symbol"], p["symbol"], row["right"], "not scorable", p["ask"],
-                  row["target"], row["exit_date"], predicted_at_target=p["roi_target"])
+                  row["target"], row["exit_date"], predicted_at_target=p["roi_target"], strike=p.get("strike"),
+                  expiry=p.get("expiry"), breakeven=p.get("breakeven"), spot_at_pick=row.get("spot"),
+                  as_of=row.get("as_of"))
     settled = today > exit_d
     as_of = exit_d + timedelta(days=1) if settled else datetime.now(timezone.utc)   # a bare date = start of that day
     snap = load_chain_snapshot(cache_dir, row["symbol"], as_of, max_age=timedelta(days=MAX_EXIT_STALENESS_DAYS))
@@ -213,6 +220,36 @@ def score(row: dict, cache_dir: str, today: date) -> Outcome | None:
 def review(cache_dir: str, today: date, symbol: str | None = None) -> list[Outcome]:
     rows = [r for r in load_picks(cache_dir) if symbol is None or r.get("symbol") == symbol.upper()]
     return [o for o in (score(r, cache_dir, today) for r in rows) if o is not None]
+
+
+def summary(outcomes: list[Outcome]) -> dict:
+    """Counts over the settled picks only: an open pick is a mark, not a result."""
+    done = [o for o in outcomes if o.status == "settled" and o.ret is not None]
+    paired = [o for o in done if o.shares_ret is not None]
+    return {"picks": len(outcomes), "settled": len(done), "open": sum(o.status == "open" for o in outcomes),
+            "not_scorable": sum(o.status == "not scorable" for o in outcomes),
+            "mean_return": sum(o.ret for o in done) / len(done) if done else None,
+            "median_return": statistics.median(o.ret for o in done) if done else None,
+            "made_money": sum(o.ret > 0 for o in done), "paired": len(paired),
+            "beat_shares": sum(o.ret > o.shares_ret for o in paired)}
+
+
+def review_payload(cache_dir: str, today: date, now: datetime | None = None) -> dict:
+    """The review as data, for another program to display. Everything in it was computed here."""
+    rows = load_picks(cache_dir)
+    outcomes = [o for o in (score(r, cache_dir, today) for r in rows) if o is not None]
+    return {"schema": SCHEMA, "generated_at": (now or datetime.now(timezone.utc)).isoformat(),
+            "as_of_date": today.isoformat(), "runs": len(rows), "runs_without_pick": len(rows) - len(outcomes),
+            "summary": summary(outcomes), "picks": [asdict(o) for o in outcomes]}
+
+
+def write_review(cache_dir: str, today: date, now: datetime | None = None) -> Path:
+    """Write ``review.json`` beside the log, atomically, so a reader never sees half of it."""
+    root = pick_dir(cache_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "review.json"
+    _atomic_write(path, json.dumps(review_payload(cache_dir, today, now), indent=1, sort_keys=True).encode())
+    return path
 
 
 def render_review(outcomes: list[Outcome], total_runs: int) -> str:
@@ -251,9 +288,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("command", choices=["review"])
     ap.add_argument("--symbol")
     ap.add_argument("--cache-dir", default=DEFAULT_CONFIG.get("data_cache_dir"))
+    ap.add_argument("--write", action="store_true", help="also write option_picks/review.json for other programs to read")
     args = ap.parse_args(argv)
+    today = date.fromisoformat(ny_today())
     runs = load_picks(args.cache_dir)
-    print(render_review(review(args.cache_dir, date.fromisoformat(ny_today()), args.symbol), len(runs)))
+    print(render_review(review(args.cache_dir, today, args.symbol), len(runs)))
+    if args.write:
+        print(f"wrote {write_review(args.cache_dir, today)}")
     return 0
 
 

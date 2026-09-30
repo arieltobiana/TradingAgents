@@ -158,3 +158,27 @@ def test_a_reader_waits_for_a_rotation_in_progress_instead_of_seeing_a_month_twi
         assert t.is_alive() and not got            # blocked, not reading a half-rotated directory
     t.join(3)
     assert [r["symbol"] for r in got[0]] == ["ONE"]
+
+
+@pytest.mark.unit
+def test_the_review_is_written_as_json_another_program_can_read(tmp_path):
+    _snap(tmp_path, datetime(2026, 12, 31, 21, tzinfo=UTC), spot=52.0, bid=14.0)
+    picklog.record_pick(str(tmp_path), {**_entry(), "spot": 40.0, "as_of": "2026-09-30 20:42:40",
+                                        "pick": {**PICK, "strike": 30.0, "expiry": "2027-01-15", "breakeven": 44.0}},
+                        now=datetime(2026, 9, 30, tzinfo=UTC))
+    picklog.record_pick(str(tmp_path), _entry("NOPICK", pick=None), now=datetime(2026, 9, 30, 1, tzinfo=UTC))
+    path = picklog.write_review(str(tmp_path), date(2027, 1, 5), now=datetime(2027, 1, 5, tzinfo=UTC))
+    data = json.loads(path.read_text())
+    assert path.name == "review.json" and data["schema"] == picklog.SCHEMA and data["runs"] == 2
+    assert data["runs_without_pick"] == 1 and data["as_of_date"] == "2027-01-05"
+    (pick,) = data["picks"]
+    assert pick["status"] == "settled" and pick["ret"] == pytest.approx(0.4) and pick["breakeven"] == 44.0
+    assert pick["strike"] == 30.0 and pick["spot_at_pick"] == 40.0 and pick["as_of"] == "2026-09-30 20:42:40"
+    assert data["summary"]["settled"] == 1 and data["summary"]["beat_shares"] == 1
+    assert not list(path.parent.glob("*.tmp"))
+
+
+@pytest.mark.unit
+def test_an_empty_log_still_writes_a_review_a_reader_can_tell_from_no_review(tmp_path):
+    data = json.loads(picklog.write_review(str(tmp_path), date(2027, 1, 5)).read_text())
+    assert data["runs"] == 0 and data["picks"] == [] and data["summary"]["settled"] == 0

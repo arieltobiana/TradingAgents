@@ -243,6 +243,27 @@ def list_snapshots(cache_dir: str, symbol: str) -> list[tuple[datetime, Path]]:
     return sorted(out)
 
 
+def spot_history(cache_dir: str, symbol: str, since: datetime) -> list[tuple[datetime, str, float]]:
+    """(fetched_at, session day, underlying price) for every archived snapshot fetched at or after ``since``.
+
+    Reads each file whole, so it is for a review that runs once a night, not a request path. A snapshot that
+    cannot be read or has no price is skipped: a gap in the history, never a made-up point.
+    """
+    since = _utc(since)
+    out = []
+    for fetched, path in list_snapshots(cache_dir, symbol):
+        if fetched < since:
+            continue
+        try:
+            meta = json.loads(gzip.decompress(path.read_bytes()))["meta"]
+            spot = float(meta["spot"])
+        except (OSError, EOFError, ValueError, KeyError, TypeError):
+            continue
+        day = meta.get("session") or fetched.astimezone(NY).date().isoformat()
+        out.append((fetched, str(day), spot))
+    return out
+
+
 def load_chain_snapshot(cache_dir: str, symbol: str, as_of: datetime | date | str,
                         max_age: timedelta = DEFAULT_MAX_AGE,
                         feed: str | None = None) -> tuple[dict, list[Quote]] | None:

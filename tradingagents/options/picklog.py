@@ -129,7 +129,7 @@ def open_pick_symbols(cache_dir: str, today: date) -> list[str]:
     seen = []
     for row in load_picks(cache_dir):
         try:
-            if row.get("pick") and date.fromisoformat(row["exit_date"]) >= cutoff and row["symbol"] not in seen:
+            if date.fromisoformat(row["exit_date"]) >= cutoff and row["symbol"] not in seen:
                 seen.append(row["symbol"])
         except (KeyError, ValueError):
             continue
@@ -160,16 +160,16 @@ def make_entry(symbol: str, right: str, spot: float, target: float, exit_date: d
 class Outcome:
     logged: str
     symbol: str
-    contract: str
+    contract: str | None          # None for a request that named no contract
     right: str
-    status: str                   # "settled" | "open" | "not scorable"
-    entry_ask: float
+    status: str                   # "settled" | "open" | "not scorable" | "no contract"
+    entry_ask: float | None
     target: float
     exit_date: str
     exit_bid: float | None = None
     ret: float | None = None
     shares_ret: float | None = None
-    stock_at_exit: float | None = None
+    stock_at_exit: float | None = None        # the stock in the chain used: at the exit date once settled, else now
     predicted_at_target: float | None = None
     reason: str = ""
     strike: float | None = None
@@ -177,6 +177,19 @@ class Outcome:
     breakeven: float | None = None
     spot_at_pick: float | None = None
     as_of: str | None = None            # when the quotes behind the pick were made, per the source
+    # The request, then and now. Everything below is computed here, from what the log and the archive hold.
+    logged_at: str | None = None        # when the request was made (ISO, UTC)
+    mark_at: str | None = None          # when the chain behind "now" was fetched (ISO, UTC)
+    days_left: int | None = None        # days from today to the exit date; negative once it has passed
+    pnl_per_contract: float | None = None     # (bid - ask) x 100: one contract, bought at the ask, sold at the bid
+    shares_pnl_per_100: float | None = None   # (stock now - stock then) x 100 shares; calls only
+    target_progress: float | None = None      # how far the stock has gone from then toward the target (1.0 = there)
+    target_touched: bool | None = None        # did any saved price reach the target since the request
+    target_touched_on: str | None = None
+    view: str | None = None             # "reached" | "missed" | "toward" | "flat" | "away"; None when unknown
+
+
+VIEW_FLAT_PROGRESS = 0.02       # within 2% of the way either side of where it started counts as "flat"
 
 
 def _quote_bid(quotes, symbol: str) -> float | None:
@@ -184,34 +197,71 @@ def _quote_bid(quotes, symbol: str) -> float | None:
     return q.bid if q is not None and q.bid > 0 else None
 
 
+def _compare_view(out: Outcome, row: dict, cache_dir: str, settled: bool) -> None:
+    """Fill in how the stock has done against the view: progress to the target, whether it was ever reached."""
+    from tradingagents.options.archive import spot_history
+
+    then, target, now = row.get("spot"), row["target"], out.stock_at_exit
+    if then and now and target != then:
+        out.target_progress = (now - then) / (target - then)
+    try:
+        since = datetime.fromisoformat(row["logged_at"])
+    except (KeyError, ValueError):
+        since = None
+    if since is not None and then:
+        hit = lambda spot: spot >= target if row["right"] == "C" else spot <= target   # noqa: E731
+        history = spot_history(cache_dir, row["symbol"], since)
+        first = next(((day, spot) for _, day, spot in history if hit(spot)), None)
+        out.target_touched = first is not None or hit(then)
+        out.target_touched_on = first[0] if first else (out.logged if hit(then) else None)
+    if out.target_touched:
+        out.view = "reached"
+    elif settled and out.stock_at_exit is not None:
+        out.view = "missed"
+    elif out.target_progress is not None:
+        out.view = ("toward" if out.target_progress > VIEW_FLAT_PROGRESS
+                    else "away" if out.target_progress < -VIEW_FLAT_PROGRESS else "flat")
+
+
 def score(row: dict, cache_dir: str, today: date) -> Outcome | None:
-    """One logged run against the archived chains; None for a run that picked nothing."""
+    """One logged request against the archived chains: how the stock and the contract have done since."""
     from tradingagents.options.archive import load_chain_snapshot
 
     p = row.get("pick")
-    if not p:
-        return None
     exit_d = date.fromisoformat(row["exit_date"])
-    out = Outcome(row["logged_at"][:10], row["symbol"], p["symbol"], row["right"], "not scorable", p["ask"],
-                  row["target"], row["exit_date"], predicted_at_target=p["roi_target"], strike=p.get("strike"),
-                  expiry=p.get("expiry"), breakeven=p.get("breakeven"), spot_at_pick=row.get("spot"),
-                  as_of=row.get("as_of"))
+    out = Outcome(row["logged_at"][:10], row["symbol"], p["symbol"] if p else None, row["right"],
+                  "not scorable" if p else "no contract", p["ask"] if p else None, row["target"], row["exit_date"],
+                  predicted_at_target=p["roi_target"] if p else None, strike=p.get("strike") if p else None,
+                  expiry=p.get("expiry") if p else None, breakeven=p.get("breakeven") if p else None,
+                  spot_at_pick=row.get("spot"), as_of=row.get("as_of"), logged_at=row["logged_at"],
+                  days_left=(exit_d - today).days,
+                  reason="" if p else "no contract paid even if the view was right")
     settled = today > exit_d
-    as_of = exit_d + timedelta(days=1) if settled else datetime.now(timezone.utc)   # a bare date = start of that day
+    # A bare date means the start of that day, so the day after is "through the end of that day": the exit date once
+    # it has passed, otherwise today (which is what makes a review reproducible for a given ``today``).
+    as_of = (exit_d if settled else today) + timedelta(days=1)
     snap = load_chain_snapshot(cache_dir, row["symbol"], as_of, max_age=timedelta(days=MAX_EXIT_STALENESS_DAYS))
     if snap is None:
         out.reason = (f"no chain archived within {MAX_EXIT_STALENESS_DAYS} days of "
                       f"{'the exit date' if settled else 'now'}; is {row['symbol']} on the nightly snapshot list?")
         return out
     meta, quotes = snap
+    out.mark_at = meta.get("fetched_at")
+    out.stock_at_exit = meta.get("spot")
+    if row["right"] == "C" and out.stock_at_exit and row.get("spot"):
+        out.shares_ret = out.stock_at_exit / row["spot"] - 1
+        out.shares_pnl_per_100 = (out.stock_at_exit - row["spot"]) * 100
+    _compare_view(out, row, cache_dir, settled)
+    if not p:
+        out.reason = ("no contract paid even if the view was right"
+                      + ("" if settled else f"; the stock is marked to the chain of {meta.get('session') or meta.get('as_of')}"))
+        return out
     bid = _quote_bid(quotes, p["symbol"])
     if bid is None:
         out.reason = "the contract has no bid in the archived chain (a worthless or missing quote is not filled in)"
         return out
     out.exit_bid, out.ret = bid, bid / p["ask"] - 1
-    out.stock_at_exit = meta.get("spot")
-    if row["right"] == "C" and out.stock_at_exit and row.get("spot"):
-        out.shares_ret = out.stock_at_exit / row["spot"] - 1
+    out.pnl_per_contract = (bid - p["ask"]) * 100
     out.status = "settled" if settled else "open"
     out.reason = "" if settled else f"marked to the chain of {meta.get('session') or meta.get('as_of')}, not a result"
     return out
@@ -219,27 +269,34 @@ def score(row: dict, cache_dir: str, today: date) -> Outcome | None:
 
 def review(cache_dir: str, today: date, symbol: str | None = None) -> list[Outcome]:
     rows = [r for r in load_picks(cache_dir) if symbol is None or r.get("symbol") == symbol.upper()]
-    return [o for o in (score(r, cache_dir, today) for r in rows) if o is not None]
+    return [score(r, cache_dir, today) for r in rows]
 
 
 def summary(outcomes: list[Outcome]) -> dict:
-    """Counts over the settled picks only: an open pick is a mark, not a result."""
-    done = [o for o in outcomes if o.status == "settled" and o.ret is not None]
+    """Counts over the settled picks only (an open pick is a mark, not a result), and over the views."""
+    picks = [o for o in outcomes if o.status != "no contract"]
+    done = [o for o in picks if o.status == "settled" and o.ret is not None]
     paired = [o for o in done if o.shares_ret is not None]
-    return {"picks": len(outcomes), "settled": len(done), "open": sum(o.status == "open" for o in outcomes),
-            "not_scorable": sum(o.status == "not scorable" for o in outcomes),
+    viewed = [o for o in outcomes if o.view is not None]
+    return {"picks": len(picks), "settled": len(done), "open": sum(o.status == "open" for o in picks),
+            "not_scorable": sum(o.status == "not scorable" for o in picks),
             "mean_return": sum(o.ret for o in done) / len(done) if done else None,
             "median_return": statistics.median(o.ret for o in done) if done else None,
             "made_money": sum(o.ret > 0 for o in done), "paired": len(paired),
-            "beat_shares": sum(o.ret > o.shares_ret for o in paired)}
+            "beat_shares": sum(o.ret > o.shares_ret for o in paired),
+            # The views themselves, whether or not a contract was named: did the stock get to the target?
+            "views": len(outcomes), "views_tracked": len(viewed),
+            "views_reached": sum(o.view == "reached" for o in viewed),
+            "views_missed": sum(o.view == "missed" for o in viewed)}
 
 
 def review_payload(cache_dir: str, today: date, now: datetime | None = None) -> dict:
     """The review as data, for another program to display. Everything in it was computed here."""
     rows = load_picks(cache_dir)
-    outcomes = [o for o in (score(r, cache_dir, today) for r in rows) if o is not None]
+    outcomes = [score(r, cache_dir, today) for r in rows]
     return {"schema": SCHEMA, "generated_at": (now or datetime.now(timezone.utc)).isoformat(),
-            "as_of_date": today.isoformat(), "runs": len(rows), "runs_without_pick": len(rows) - len(outcomes),
+            "as_of_date": today.isoformat(), "runs": len(rows),
+            "runs_without_pick": sum(o.status == "no contract" for o in outcomes),
             "summary": summary(outcomes), "picks": [asdict(o) for o in outcomes]}
 
 
@@ -252,21 +309,52 @@ def write_review(cache_dir: str, today: date, now: datetime | None = None) -> Pa
     return path
 
 
+_VIEW_WORDS = {"reached": "reached your target", "missed": "did not reach your target", "toward": "moving toward your target",
+               "flat": "not moved yet", "away": "moving away from your target"}
+
+
+def _money(x: float | None, signed: bool = False) -> str:
+    return "-" if x is None else (f"{x:+,.2f}" if signed else f"{x:,.2f}")
+
+
+def _pct(x: float | None) -> str:
+    """A signed percent; a figure that rounds to zero carries no sign (\"-0.0%\" reads as a loss that is not there)."""
+    if x is None:
+        return "-"
+    return "0.0%" if abs(x) < 0.0005 else f"{x:+.1%}"
+
+
 def render_review(outcomes: list[Outcome], total_runs: int) -> str:
+    """Each request as then and now: what was true when you asked, what is true at the latest saved chain."""
     if not outcomes:
-        return f"{total_runs} runs logged, none with a pick to review yet."
-    lines = [f"{'logged':11}{'contract':22}{'status':13}{'paid':>7}{'exit bid':>9}{'return':>8}{'shares':>8}"
-             f"{'model@target':>13}  note"]
+        return f"{total_runs} runs logged, none to review yet."
+    lines = []
     for o in outcomes:
-        lines.append(f"{o.logged:11}{o.contract:22}{o.status:13}{o.entry_ask:7.2f}"
-                     f"{(f'{o.exit_bid:.2f}' if o.exit_bid is not None else '-'):>9}"
-                     f"{(f'{o.ret:+.0%}' if o.ret is not None else '-'):>8}"
-                     f"{(f'{o.shares_ret:+.0%}' if o.shares_ret is not None else '-'):>8}"
-                     f"{(f'{o.predicted_at_target:+.0%}' if o.predicted_at_target is not None else '-'):>13}  {o.reason}")
+        kind = "call" if o.right == "C" else "put"
+        what = f"{o.contract} ({o.status})" if o.contract else "no contract named"
+        lines += [f"{o.symbol} {kind}  {what}",
+                  f"  asked   {o.logged_at[:16].replace('T', ' ') if o.logged_at else o.logged} UTC   stock {_money(o.spot_at_pick)}"
+                  f"   contract ask {_money(o.entry_ask)}   view: {_money(o.target)} by {o.exit_date}"]
+        now = (o.mark_at or "")[:16].replace("T", " ")
+        stock_chg = (o.stock_at_exit / o.spot_at_pick - 1) if o.stock_at_exit and o.spot_at_pick else None
+        lines.append(f"  {'result' if o.status == 'settled' else 'latest'}  {now or '-'} UTC   stock {_money(o.stock_at_exit)} "
+                     f"({_pct(stock_chg)})   contract bid {_money(o.exit_bid)} ({_pct(o.ret)})")
+        if o.pnl_per_contract is not None or o.shares_pnl_per_100 is not None:
+            lines.append(f"  P&L     contract {_money(o.pnl_per_contract, True)} $ per contract (ask in, bid out)"
+                         f"   |   100 shares {_money(o.shares_pnl_per_100, True)} $")
+        if o.view:
+            prog = f" ({0 if abs(o.target_progress) < 0.005 else o.target_progress:.0%} of the way)" if o.target_progress is not None else ""
+            touched = f"; first reached {o.target_touched_on}" if o.target_touched_on else ""
+            days = ""
+            if o.days_left is not None:
+                days = f", {o.days_left} days left" if o.days_left >= 0 else f", {-o.days_left} days past the exit date"
+            lines.append(f"  view    {_VIEW_WORDS[o.view]}{prog}{touched}{days}")
+        if o.reason:
+            lines.append(f"  note    {o.reason}")
+        lines.append("")
     done = [o for o in outcomes if o.status == "settled" and o.ret is not None]
-    lines.append("")
     if not done:
-        lines.append("Nothing has reached its exit date yet. Open picks are marks, not results.")
+        lines.append("Nothing has reached its exit date yet. Open figures are marks, not results.")
     else:
         paired = [o for o in done if o.shares_ret is not None]
         beat = sum(o.ret > o.shares_ret for o in paired)
@@ -280,6 +368,27 @@ def render_review(outcomes: list[Outcome], total_runs: int) -> str:
     return "\n".join(lines)
 
 
+def refresh_open(cache_dir: str, today: date, symbol: str | None = None) -> list[str]:
+    """Fetch and archive a fresh chain for each ticker with a request still open; returns the tickers refreshed.
+
+    A failed fetch is reported and skipped: the review then uses the newest chain it already has.
+    """
+    from tradingagents.dataflows.vendors.options import fetch_chain
+    from tradingagents.options.archive import record_chain_snapshot
+
+    done = []
+    for sym in open_pick_symbols(cache_dir, today):
+        if symbol and sym != symbol.upper():
+            continue
+        try:
+            meta, quotes = fetch_chain(sym)
+            record_chain_snapshot(cache_dir, sym, meta, quotes)
+            done.append(sym)
+        except Exception as exc:  # noqa: BLE001 — one ticker must not stop the review
+            print(f"{sym}: could not refresh ({type(exc).__name__}: {exc})")
+    return done
+
+
 def main(argv: list[str] | None = None) -> int:
     from tradingagents.default_config import DEFAULT_CONFIG
     from tradingagents.dataflows.vendors.options import ny_today
@@ -289,8 +398,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--symbol")
     ap.add_argument("--cache-dir", default=DEFAULT_CONFIG.get("data_cache_dir"))
     ap.add_argument("--write", action="store_true", help="also write option_picks/review.json for other programs to read")
+    ap.add_argument("--live", action="store_true",
+                    help="first fetch and save a fresh chain for every ticker whose exit date has not passed, so 'now' is today")
     args = ap.parse_args(argv)
     today = date.fromisoformat(ny_today())
+    if args.live:
+        refresh_open(args.cache_dir, today, args.symbol)
     runs = load_picks(args.cache_dir)
     print(render_review(review(args.cache_dir, today, args.symbol), len(runs)))
     if args.write:

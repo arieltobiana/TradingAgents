@@ -113,7 +113,8 @@ def test_before_the_exit_date_a_pick_is_a_labelled_mark_and_a_run_with_no_pick_i
     row = {"logged_at": datetime.now(UTC).isoformat(), **_entry(exit_date=(date.today() + timedelta(days=60)).isoformat())}
     out = picklog.score(row, str(tmp_path), today=date.today())
     assert out.status == "open" and out.ret == pytest.approx(-0.05) and "not a result" in out.reason
-    assert picklog.score({**row, "pick": None}, str(tmp_path), today=date.today()) is None
+    nothing = picklog.score({**row, "pick": None}, str(tmp_path), today=date.today())
+    assert nothing.status == "no contract" and nothing.contract is None and nothing.stock_at_exit == 41.0
 
 
 @pytest.mark.unit
@@ -123,7 +124,7 @@ def test_the_review_summary_counts_only_settled_picks_and_warns_on_a_small_sampl
     text = picklog.render_review(picklog.review(str(tmp_path), date(2027, 1, 5)), 1)
     assert "Settled: 1 of 1" in text and "beat the shares in 1 of 1" in text and "first look" in text
     assert "0 runs" not in text
-    assert "none with a pick" in picklog.render_review([], 3)
+    assert "none to review yet" in picklog.render_review([], 3)
 
 
 @pytest.mark.unit
@@ -132,8 +133,9 @@ def test_tickers_with_a_pick_still_to_score_are_named_for_the_nightly_snapshot(t
     picklog.record_pick(str(tmp_path), _entry("IREN", exit_date="2026-12-31"), now=now)
     picklog.record_pick(str(tmp_path), _entry("OLD", exit_date="2026-08-01"), now=now)
     picklog.record_pick(str(tmp_path), _entry("NONE", pick=None), now=now)
-    assert picklog.open_pick_symbols(str(tmp_path), date(2026, 10, 1)) == ["IREN"]
-    assert picklog.open_pick_symbols(str(tmp_path), date(2026, 12, 31)) == ["IREN"]   # the exit day's chain is still wanted
+    # A request that named no contract is still a view to compare with the stock, so its ticker is archived too.
+    assert picklog.open_pick_symbols(str(tmp_path), date(2026, 10, 1)) == ["IREN", "NONE"]
+    assert picklog.open_pick_symbols(str(tmp_path), date(2026, 12, 31)) == ["IREN", "NONE"]   # the exit day's chain is still wanted
     assert picklog.open_pick_symbols(str(tmp_path), date(2027, 1, 1)) == []          # a later chain cannot be used to score it
 
 
@@ -171,7 +173,8 @@ def test_the_review_is_written_as_json_another_program_can_read(tmp_path):
     data = json.loads(path.read_text())
     assert path.name == "review.json" and data["schema"] == picklog.SCHEMA and data["runs"] == 2
     assert data["runs_without_pick"] == 1 and data["as_of_date"] == "2027-01-05"
-    (pick,) = data["picks"]
+    pick, nothing = data["picks"]
+    assert nothing["status"] == "no contract" and nothing["contract"] is None and nothing["symbol"] == "NOPICK"
     assert pick["status"] == "settled" and pick["ret"] == pytest.approx(0.4) and pick["breakeven"] == 44.0
     assert pick["strike"] == 30.0 and pick["spot_at_pick"] == 40.0 and pick["as_of"] == "2026-09-30 20:42:40"
     assert data["summary"]["settled"] == 1 and data["summary"]["beat_shares"] == 1
@@ -182,3 +185,116 @@ def test_the_review_is_written_as_json_another_program_can_read(tmp_path):
 def test_an_empty_log_still_writes_a_review_a_reader_can_tell_from_no_review(tmp_path):
     data = json.loads(picklog.write_review(str(tmp_path), date(2027, 1, 5)).read_text())
     assert data["runs"] == 0 and data["picks"] == [] and data["summary"]["settled"] == 0
+
+
+def _asked(spot=40.0, target=50.0, right="C", pick=PICK, when="2026-09-30T12:00:00+00:00", exit_date="2026-12-31"):
+    return {"logged_at": when, **_entry(spot=spot, target=target, right=right, pick=pick, exit_date=exit_date)}
+
+
+@pytest.mark.unit
+def test_a_request_is_compared_then_and_now_in_dollars_and_in_progress_to_the_target(tmp_path):
+    _snap(tmp_path, datetime(2026, 10, 15, 21, tzinfo=UTC), spot=45.0, bid=12.0)
+    out = picklog.score(_asked(), str(tmp_path), today=date(2026, 10, 16))
+    assert out.status == "open" and out.logged_at == "2026-09-30T12:00:00+00:00" and out.mark_at.startswith("2026-10-15T21")
+    assert out.pnl_per_contract == pytest.approx(200.0)              # (12.00 - 10.00) x 100: one contract, ask in, bid out
+    assert out.shares_pnl_per_100 == pytest.approx(500.0)             # (45 - 40) x 100 shares
+    assert out.target_progress == pytest.approx(0.5)                  # half way from 40 to 50
+    assert out.view == "toward" and out.target_touched is False and out.days_left == 76
+
+
+@pytest.mark.unit
+def test_the_target_counts_as_reached_when_any_saved_price_got_there_even_if_it_fell_back(tmp_path):
+    _snap(tmp_path, datetime(2026, 10, 10, 21, tzinfo=UTC), spot=51.0, bid=20.0)       # touched the target
+    _snap(tmp_path, datetime(2026, 10, 20, 21, tzinfo=UTC), spot=44.0, bid=11.0)       # then fell back
+    out = picklog.score(_asked(), str(tmp_path), today=date(2026, 10, 21))
+    assert out.target_touched is True and out.target_touched_on == "2026-10-10" and out.view == "reached"
+    assert out.target_progress == pytest.approx(0.4)                                    # but it is only 40% of the way now
+
+
+@pytest.mark.unit
+def test_a_snapshot_from_before_the_request_cannot_count_as_reaching_the_target(tmp_path):
+    _snap(tmp_path, datetime(2026, 9, 20, 21, tzinfo=UTC), spot=55.0, bid=22.0)         # before the request
+    _snap(tmp_path, datetime(2026, 10, 2, 21, tzinfo=UTC), spot=41.0, bid=10.5)
+    out = picklog.score(_asked(), str(tmp_path), today=date(2026, 10, 3))
+    assert out.target_touched is False and out.view == "toward" and out.target_progress == pytest.approx(0.1)
+
+
+@pytest.mark.unit
+def test_a_put_view_reaches_its_target_by_falling_and_has_no_share_comparison(tmp_path):
+    put = {**PICK, "symbol": "IREN270115P00045000"}
+    snap_quote = Quote(put["symbol"], "P", 45.0, date(2027, 1, 15), 9.0, 9.4, 0.8, -0.5, None, None, None, 500.0, 10.0)
+    meta = {"source": "Cboe delayed quotes", "as_of": "x", "spot": 34.0, "iv30": 70.0, "session": "2026-10-10", "feed": "delayed"}
+    record_chain_snapshot(str(tmp_path), "IREN", meta, [snap_quote], fetched_at=datetime(2026, 10, 10, 21, tzinfo=UTC))
+    out = picklog.score(_asked(spot=40.0, target=35.0, right="P", pick=put), str(tmp_path), today=date(2026, 10, 11))
+    assert out.view == "reached" and out.shares_pnl_per_100 is None and out.shares_ret is None
+    assert out.pnl_per_contract == pytest.approx((9.0 - PICK["ask"]) * 100)
+
+
+@pytest.mark.unit
+def test_after_the_exit_date_a_target_never_reached_is_missed(tmp_path):
+    _snap(tmp_path, datetime(2026, 12, 31, 21, tzinfo=UTC), spot=43.0, bid=9.0)
+    out = picklog.score(_asked(), str(tmp_path), today=date(2027, 1, 5))
+    assert out.status == "settled" and out.view == "missed" and out.days_left == -5
+
+
+@pytest.mark.unit
+def test_a_stock_that_has_not_moved_is_flat_and_one_that_fell_is_moving_away(tmp_path):
+    _snap(tmp_path, datetime(2026, 10, 2, 21, tzinfo=UTC), spot=40.1, bid=10.0)
+    assert picklog.score(_asked(), str(tmp_path), today=date(2026, 10, 3)).view == "flat"
+    _snap(tmp_path, datetime(2026, 10, 3, 21, tzinfo=UTC), spot=37.0, bid=8.0)
+    assert picklog.score(_asked(), str(tmp_path), today=date(2026, 10, 4)).view == "away"
+
+
+@pytest.mark.unit
+def test_a_request_that_named_no_contract_still_says_how_the_stock_did_against_the_view(tmp_path):
+    _snap(tmp_path, datetime(2026, 10, 15, 21, tzinfo=UTC), spot=45.0, bid=12.0)
+    out = picklog.score(_asked(pick=None), str(tmp_path), today=date(2026, 10, 16))
+    assert out.status == "no contract" and out.contract is None and out.pnl_per_contract is None
+    assert out.view == "toward" and out.shares_pnl_per_100 == pytest.approx(500.0)
+    assert "no contract paid even if the view was right" in out.reason
+
+
+@pytest.mark.unit
+def test_the_summary_counts_views_whether_or_not_a_contract_was_named(tmp_path):
+    _snap(tmp_path, datetime(2026, 10, 10, 21, tzinfo=UTC), spot=51.0, bid=20.0)
+    picklog.record_pick(str(tmp_path), {**_entry(spot=40.0), "pick": PICK}, now=datetime(2026, 9, 30, tzinfo=UTC))
+    picklog.record_pick(str(tmp_path), {**_entry(spot=40.0), "pick": None}, now=datetime(2026, 9, 30, 1, tzinfo=UTC))
+    data = picklog.review_payload(str(tmp_path), date(2026, 10, 11))
+    assert data["runs"] == 2 and data["runs_without_pick"] == 1
+    assert data["summary"]["picks"] == 1 and data["summary"]["views"] == 2
+    assert data["summary"]["views_tracked"] == 2 and data["summary"]["views_reached"] == 2
+
+
+@pytest.mark.unit
+def test_the_terminal_review_lays_each_request_out_as_then_and_now(tmp_path):
+    _snap(tmp_path, datetime(2026, 10, 15, 21, tzinfo=UTC), spot=45.0, bid=12.0)
+    picklog.record_pick(str(tmp_path), {**_entry(spot=40.0), "pick": PICK}, now=datetime(2026, 9, 30, 12, tzinfo=UTC))
+    text = picklog.render_review(picklog.review(str(tmp_path), date(2026, 10, 16)), 1)
+    assert "asked   2026-09-30 12:00 UTC   stock 40.00   contract ask 10.00   view: 50.00 by 2026-12-31" in text
+    assert "contract bid 12.00 (+20.0%)" in text and "stock 45.00 (+12.5%)" in text
+    assert "+200.00 $ per contract" in text and "100 shares +500.00 $" in text
+    assert "moving toward your target (50% of the way)" in text and "76 days left" in text
+
+
+@pytest.mark.unit
+def test_live_refresh_archives_a_fresh_chain_per_open_ticker_and_survives_a_failed_fetch(tmp_path, monkeypatch):
+    picklog.record_pick(str(tmp_path), _entry("IREN", exit_date="2026-12-31"), now=datetime(2026, 9, 30, tzinfo=UTC))
+    picklog.record_pick(str(tmp_path), _entry("BAD", exit_date="2026-12-31"), now=datetime(2026, 9, 30, tzinfo=UTC))
+    from tradingagents.dataflows.vendors import options as vendor
+
+    def fetch(sym):
+        if sym == "BAD":
+            raise RuntimeError("no chain")
+        return {"source": "Cboe delayed quotes", "as_of": "x", "spot": 44.0, "iv30": 70.0, "session": "2026-10-05",
+                "feed": "delayed"}, [_quote(9.0)]
+
+    monkeypatch.setattr(vendor, "fetch_chain", fetch)
+    assert picklog.refresh_open(str(tmp_path), date(2026, 10, 5)) == ["IREN"]
+    from tradingagents.options.archive import list_snapshots
+
+    assert len(list_snapshots(str(tmp_path), "IREN")) == 1 and list_snapshots(str(tmp_path), "BAD") == []
+
+
+@pytest.mark.unit
+def test_a_move_that_rounds_to_zero_is_printed_without_a_sign():
+    assert picklog._pct(-0.0000024) == "0.0%" and picklog._pct(0.1234) == "+12.3%" and picklog._pct(-0.031) == "-3.1%"

@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -150,8 +151,22 @@ def fetch_cboe(symbol: str) -> tuple[dict, list[Quote]]:
     return meta, quotes
 
 
+def _keychain(service: str) -> str | None:
+    """A generic password from the macOS login keychain, or None when there is none (or no
+    keychain: Linux, CI). Same item names trade-dash reads, so one place holds the keys."""
+    try:
+        r = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", service, "-w"],
+                           capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() or None if r.returncode == 0 else None
+
+
 def _alpaca_headers() -> dict | None:
-    key, secret = os.environ.get("ALPACA_API_KEY_ID"), os.environ.get("ALPACA_API_SECRET_KEY")
+    """Environment first (tests, a .env), then the keychain: a launchd job has no shell
+    profile, so without the keychain the Alpaca fallback never had keys when Cboe failed."""
+    key = os.environ.get("ALPACA_API_KEY_ID") or _keychain("alpaca-api-key-id")
+    secret = os.environ.get("ALPACA_API_SECRET_KEY") or _keychain("alpaca-api-secret-key")
     if not key or not secret:
         return None
     return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}

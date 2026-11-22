@@ -88,3 +88,10 @@ def _isolate_config():
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
     yield
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_keychain(monkeypatch):
+    """The options vendor reads Alpaca keys from the macOS keychain; a test must never reach it."""
+    from tradingagents.dataflows.vendors import options
+    monkeypatch.setattr(options, "_keychain", lambda service: None)

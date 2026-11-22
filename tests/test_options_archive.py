@@ -233,3 +233,16 @@ def test_cli_snapshots_a_watchlist_and_fails_only_when_everything_failed(monkeyp
     assert len(out) == 2 and out[0].startswith("IREN: 2 quotes") and out[1].startswith("BAD: FAILED")
     assert len(list_snapshots(str(tmp_path), "IREN")) == 1
     assert archive.main(["--cache-dir", str(tmp_path), "BAD"]) == 1
+
+
+def test_alpaca_keys_come_from_the_environment_then_the_keychain(monkeypatch):
+    monkeypatch.delenv("ALPACA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("ALPACA_API_SECRET_KEY", raising=False)
+    items = {"alpaca-api-key-id": "kc-id", "alpaca-api-secret-key": "kc-secret"}
+    monkeypatch.setattr(options, "_keychain", items.get)
+    assert options._alpaca_headers() == {"APCA-API-KEY-ID": "kc-id", "APCA-API-SECRET-KEY": "kc-secret"}
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "env-id")
+    assert options._alpaca_headers()["APCA-API-KEY-ID"] == "env-id"
+    monkeypatch.setattr(options, "_keychain", lambda service: None)
+    monkeypatch.delenv("ALPACA_API_KEY_ID")
+    assert options._alpaca_headers() is None

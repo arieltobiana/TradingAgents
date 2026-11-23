@@ -290,7 +290,7 @@ def test_every_arguing_agent_sees_the_fact_sheet():
 def test_the_fact_check_node_follows_the_config(enabled):
     from tradingagents.graph.conditional_logic import ConditionalLogic
 
-    workflow = GraphSetup(object(), object(), ConditionalLogic(), fact_check=enabled).setup_graph(("market",))
+    workflow = GraphSetup(object(), object(), ConditionalLogic(), 20, fact_check=enabled).setup_graph(("market",))
 
     assert ("Fact Check" in workflow.nodes) is enabled
 

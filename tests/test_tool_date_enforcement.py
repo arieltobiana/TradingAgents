@@ -28,6 +28,7 @@ TRADE_DATE = "2026-08-14"
     (None, TRADE_DATE),             # omitted
     ("Sept 1", TRADE_DATE),         # unparseable
     ("", TRADE_DATE),
+    ("2026-8-1", "2026-08-01"),     # unpadded: served in its canonical form
 ])
 def test_as_of_takes_the_earlier_date(requested, expected):
     assert as_of(requested, TRADE_DATE) == expected
@@ -36,6 +37,7 @@ def test_as_of_takes_the_earlier_date(requested, expected):
 @pytest.mark.unit
 def test_as_of_without_a_trade_date_passes_the_request_through():
     assert as_of("2026-09-14", "") == "2026-09-14"
+    assert as_of("2026-9-14", "") == "2026-09-14"
 
 
 @pytest.mark.unit
@@ -43,6 +45,7 @@ def test_as_of_without_a_trade_date_passes_the_request_through():
     ("2026-08-01", "2026-09-14", ("2026-08-01", TRADE_DATE)),  # end clamped
     ("2026-08-01", "2026-08-10", ("2026-08-01", "2026-08-10")),  # inside: unchanged
     ("2026-09-01", "2026-09-08", ("2026-08-07", TRADE_DATE)),  # wholly later: span kept, moved back
+    ("2026-8-1", "2026-8-10", ("2026-08-01", "2026-08-10")),  # unpadded: canonical
 ])
 def test_as_of_window(start, end, expected):
     assert as_of_window(start, end, TRADE_DATE) == expected
@@ -68,8 +71,31 @@ def test_trade_date_is_hidden_from_the_model(tool):
     assert "trade_date" not in tool.tool_call_schema.model_json_schema()["properties"]
 
 
+INSTRUMENT_TOOLS = [
+    tools.get_stock_data, tools.get_indicators, tools.get_verified_market_snapshot,
+    tools.get_fundamentals, tools.get_balance_sheet, tools.get_cashflow,
+    tools.get_income_statement, tools.get_news, tools.get_insider_transactions,
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tool", INSTRUMENT_TOOLS, ids=lambda t: t.name)
+def test_the_instrument_is_hidden_from_the_model(tool):
+    """The model once passed an indicator name as the symbol ("rsi", "atr" are
+    real tickers), and another company's data reached the report."""
+    properties = tool.tool_call_schema.model_json_schema()["properties"]
+    assert "symbol" not in properties and "ticker" not in properties
+
+
+@pytest.mark.unit
+def test_a_tool_serves_the_run_instrument_whatever_the_model_passes():
+    args = _run(tools.get_indicators, {"symbol": "RSI", "indicator": "rsi", "curr_date": TRADE_DATE}, tools)
+    assert args[1] == "NVDA"
+
+
 class _State(MessagesState):
     trade_date: str
+    company_of_interest: str
 
 
 def _run(tool, args, module):
@@ -82,28 +108,45 @@ def _run(tool, args, module):
         graph.compile().invoke({
             "messages": [AIMessage("", tool_calls=[{"name": tool.name, "args": args, "id": "1"}])],
             "trade_date": TRADE_DATE,
+            "company_of_interest": "NVDA",
         })
     return routed.call_args.args
 
 
 @pytest.mark.unit
 def test_statement_tool_with_omitted_date_uses_the_run_date():
-    args = _run(tools.get_balance_sheet, {"ticker": "AAPL"}, tools)
+    args = _run(tools.get_balance_sheet, {}, tools)
     assert args[-1] == TRADE_DATE  # #1331: an omitted date no longer means unfiltered
 
 
 @pytest.mark.unit
 def test_future_curr_date_from_the_model_is_clamped():
-    args = _run(tools.get_fundamentals,
-                {"ticker": "AAPL", "curr_date": "2026-09-14"}, tools)
-    assert args == ("get_fundamentals", "AAPL", TRADE_DATE)
+    args = _run(tools.get_fundamentals, {"curr_date": "2026-09-14"}, tools)
+    assert args == ("get_fundamentals", "NVDA", TRADE_DATE)
 
 
 @pytest.mark.unit
 def test_future_window_from_the_model_is_clamped():
-    args = _run(tools.get_stock_data,
-                {"symbol": "AAPL", "start_date": "2026-08-01", "end_date": "2026-09-14"}, tools)
-    assert args == ("get_stock_data", "AAPL", "2026-08-01", TRADE_DATE)
+    args = _run(tools.get_stock_data, {"start_date": "2026-08-01", "end_date": "2026-09-14"}, tools)
+    assert args == ("get_stock_data", "NVDA", "2026-08-01", TRADE_DATE)
+
+
+@pytest.mark.unit
+def test_an_unpadded_date_reaches_the_vendor_in_canonical_form():
+    # Vendors compare dates as YYYY-MM-DD text: "2026-07-23" > "2026-7-3" is False,
+    # so an unpadded date would let a filing made after it through.
+    args = _run(tools.get_income_statement, {"curr_date": "2026-7-3"}, tools)
+    assert args[-1] == "2026-07-03"
+    args = _run(tools.get_news, {"start_date": "2026-7-1", "end_date": "2026-7-3"}, tools)
+    assert args[-2:] == ("2026-07-01", "2026-07-03")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tool", [tools.get_balance_sheet, tools.get_cashflow, tools.get_income_statement])
+def test_a_statement_frequency_is_one_the_vendors_serve(tool):
+    # Any other word was served annual figures under the word asked for.
+    schema = tool.tool_call_schema.model_json_schema()["properties"]["freq"]
+    assert schema["enum"] == ["annual", "quarterly"]
 
 
 @pytest.mark.unit
@@ -111,6 +154,32 @@ def test_direct_call_without_state_is_unchanged():
     with mock.patch.object(tools, "route_to_vendor", return_value="ok") as routed:
         tools.get_news.func("AAPL", "2026-09-01", "2026-09-08")
     assert routed.call_args.args == ("get_news", "AAPL", "2026-09-01", "2026-09-08")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tool", ["get_news", "get_stock_data"])
+def test_a_start_date_that_is_not_a_date_is_sent_back_to_the_model(tool):
+    # A model can append a stray character to a date (#1476). No window can be
+    # guessed from it, so the vendor is not called and the model is told the form.
+    with mock.patch.object(tools, "route_to_vendor", return_value="ok") as routed:
+        out = getattr(tools, tool).func("NVDA", "2026-09-26\u0629", "2026-10-03", trade_date="2026-10-03")
+    assert not routed.called
+    assert "YYYY-MM-DD" in out and "start_date" in out
+
+
+@pytest.mark.unit
+def test_a_window_that_ends_before_it_starts_is_sent_back_to_the_model():
+    # A reversed window reached the vendor, which then reported no data for it.
+    with mock.patch.object(tools, "route_to_vendor", return_value="ok") as routed:
+        out = tools.get_stock_data.func("NVDA", "2026-08-12", "2026-08-01", trade_date=TRADE_DATE)
+    assert not routed.called
+    assert "start_date" in out and "end_date" in out
+
+
+@pytest.mark.unit
+def test_a_window_whose_start_is_not_a_date_is_refused():
+    with pytest.raises(ValueError, match="start_date"):
+        as_of_window("2026-09-26\u0629", "2026-10-03", "2026-10-03")
 
 
 # --- the run date itself (#1319) -------------------------------------------------
@@ -122,6 +191,8 @@ def test_propagate_rejects_a_non_canonical_date(bad):
 
     with pytest.raises(ValueError, match="YYYY-MM-DD"):
         object.__new__(TradingAgentsGraph).propagate("AAPL", bad)
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):  # the CLI starts a run here
+        object.__new__(TradingAgentsGraph).create_run_state("AAPL", bad)
 
 
 @pytest.mark.unit

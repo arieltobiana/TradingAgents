@@ -87,6 +87,10 @@ def _coerce_max_tokens(value):
     return n
 
 
+# Providers that take OpenAI's ``openai_reasoning_effort``.
+REASONING_EFFORT_PROVIDERS = ("openai", "chatgpt")
+
+
 def build_llm_kwargs(config: dict) -> dict[str, Any]:
     """Keyword arguments for ``create_llm_client`` from a TradingAgents config."""
     kwargs = {}
@@ -97,7 +101,7 @@ def build_llm_kwargs(config: dict) -> dict[str, Any]:
         if thinking_level:
             kwargs["thinking_level"] = thinking_level
 
-    elif provider == "openai":
+    elif provider in REASONING_EFFORT_PROVIDERS:
         reasoning_effort = config.get("openai_reasoning_effort")
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
@@ -128,3 +132,25 @@ def build_llm_kwargs(config: dict) -> dict[str, Any]:
         kwargs[key] = _coerce_max_tokens(max_tokens)
 
     return kwargs
+
+
+def tier_provider(config: dict, tier: str) -> str:
+    """The provider of the ``quick`` or ``deep`` model tier: its own, else ``llm_provider``."""
+    return (config.get(f"{tier}_think_provider") or config["llm_provider"]).lower()
+
+
+def create_tier_client(config: dict, tier: str, **extra) -> BaseLLMClient:
+    """The client for the ``quick`` or ``deep`` model tier (#1440).
+
+    A tier on its own provider gets that provider's settings (thinking level,
+    reasoning effort, the name of the output-token cap) and its own endpoint,
+    else the provider's default: ``backend_url`` belongs to ``llm_provider``.
+    """
+    provider = tier_provider(config, tier)
+    if provider == config["llm_provider"].lower():
+        base_url = config.get(f"{tier}_think_backend_url") or config.get("backend_url")
+    else:
+        base_url = config.get(f"{tier}_think_backend_url")
+    kwargs = build_llm_kwargs({**config, "llm_provider": provider})
+    return create_llm_client(provider=provider, model=config[f"{tier}_think_llm"], base_url=base_url,
+                             **kwargs, **extra)

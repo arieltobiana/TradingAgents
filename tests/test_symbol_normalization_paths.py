@@ -10,7 +10,7 @@ import pandas as pd
 import tradingagents.agents.context as au
 import tradingagents.dataflows.vendors.yahoo.market as yahoo_market
 import tradingagents.dataflows.vendors.yahoo.news as ynews
-from tradingagents.graph import settlement
+from tradingagents.memory import settlement
 
 
 def test_identity_lookup_normalizes_symbol(monkeypatch):
@@ -25,7 +25,7 @@ def test_identity_lookup_normalizes_symbol(monkeypatch):
             return {"longName": "Gold Futures", "quoteType": "FUTURE"}
 
     monkeypatch.setattr(yahoo_market.yf, "Ticker", FakeTicker)
-    au.resolve_instrument_identity.cache_clear()
+    au._identity.cache_clear()
 
     identity = au.resolve_instrument_identity("XAUUSD")
 
@@ -54,7 +54,7 @@ def test_fetch_returns_normalizes_symbol(monkeypatch):
     assert queried[0] == "GC=F"  # stock symbol normalized (#984)
     assert queried[1] == "SPY"   # benchmark left as the canonical symbol
     assert raw is not None and days is not None
-    assert resolved == "2025-01-07"  # resolution date recorded (#1251)
+    assert resolved == "2025-01-08"  # resolution date recorded (#1251)
 
 
 def test_news_lookup_normalizes_symbol(monkeypatch):
@@ -67,11 +67,20 @@ def test_news_lookup_normalizes_symbol(monkeypatch):
         def get_news(self, count):
             return []
 
+    class FakeSearch:
+        def __init__(self, query, **k):
+            seen["searched"] = query
+            self.news = [{"title": "Gold", "publisher": "P", "link": "l",
+                          "providerPublishTime": 1736150400, "relatedTickers": ["GC=F"]}]
+            self.quotes = [{"symbol": "GC=F"}]
+
     monkeypatch.setattr(ynews.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(ynews.yf, "Search", FakeSearch)
     monkeypatch.setattr(ynews, "yf_retry", lambda fn: fn())
 
     out = ynews.get_news_yfinance("XAUUSD", "2025-01-01", "2025-01-10")
 
     assert seen["symbol"] == "GC=F"   # news queried with the canonical symbol
+    assert seen["searched"] == "GC=F"
     assert "XAUUSD" in out            # the user's ticker stays in the report
     assert "GC=F" in out              # provenance noted

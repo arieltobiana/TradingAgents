@@ -11,11 +11,12 @@ outcomes (a "Yes" at 0.76 means the market prices a 76% chance).
 """
 import json
 import logging
-from datetime import datetime, timezone
+import math
+from datetime import UTC, datetime
 
 import requests
 
-from tradingagents.dataflows.date_window import get_current_date
+from tradingagents.dataflows.date_window import is_historical
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,22 @@ def _is_forward_looking(market: dict, now: datetime) -> bool:
     )
 
 
-def get_prediction_markets(topic: str, limit: int | None = None, curr_date: str | None = None) -> str:
+def _odds(prob: float) -> str:
+    """A probability as a percentage; within 1% of 0 or 100 its distance from
+    there keeps two significant digits, so 0.05% is not 0% and 99.95% not 100%."""
+    def decimals(distance: float) -> int:
+        return 1 - math.floor(math.log10(distance))
+
+    if 0 < prob < 0.01:
+        percent = prob * 100
+        return f"{percent:.{decimals(percent)}f}".rstrip("0").rstrip(".") + "%"
+    if 0.99 < prob < 1:
+        distance = (1 - prob) * 100
+        return f"{100 - distance:.{decimals(distance)}f}".rstrip("0").rstrip(".") + "%"
+    return f"{prob:.0%}"
+
+
+def get_prediction_markets(topic: str, limit: int | None = None, as_of_date: str | None = None) -> str:
     """Return live prediction-market probabilities for an event topic.
 
     Args:
@@ -75,7 +91,7 @@ def get_prediction_markets(topic: str, limit: int | None = None, curr_date: str 
             "US election", or a sector/company event.
         limit: Max markets to return (ranked by traded volume); ``None`` uses
             DEFAULT_LIMIT.
-        curr_date: The analysis date. Polymarket serves only live odds, so a
+        as_of_date: The analysis date. Polymarket serves only live odds, so a
             date before today withholds them.
 
     Returns:
@@ -83,11 +99,11 @@ def get_prediction_markets(topic: str, limit: int | None = None, curr_date: str 
         each with its implied probability, traded volume, resolution date, and
         recent (1-week) move.
     """
-    if curr_date and curr_date < get_current_date():
+    if is_historical(as_of_date):
         return (
-            f"Prediction-market odds are withheld for {curr_date}. Polymarket serves "
+            f"Prediction-market odds are withheld for {as_of_date}. Polymarket serves "
             f"only live odds on open markets, with no historical vintage, so serving "
-            f"them would put post-decision information into a {curr_date} analysis."
+            f"them would put post-decision information into a {as_of_date} analysis."
         )
     if limit is None:
         limit = DEFAULT_LIMIT
@@ -101,7 +117,7 @@ def get_prediction_markets(topic: str, limit: int | None = None, curr_date: str 
             f"Proceed without prediction-market signal for '{topic}'."
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     candidates = [
         m
         for event in data.get("events", [])
@@ -142,7 +158,7 @@ def get_prediction_markets(topic: str, limit: int | None = None, curr_date: str 
             else ""
         )
         lines.append(
-            f"- **{m.get('question')}** — {label} {prob:.0%} "
+            f"- **{m.get('question')}** — {label} {_odds(prob)} "
             f"(${volume:,.0f} volume, resolves {end_date}{wk_str})"
         )
 

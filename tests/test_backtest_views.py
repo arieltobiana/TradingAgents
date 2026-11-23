@@ -11,9 +11,14 @@ from __future__ import annotations
 import pytest
 
 import tradingagents.backtest as bt
-from tradingagents.agents.schemas import VIEW_FLAT_SD, PortfolioDecision, PortfolioRating, render_pm_decision
+from tradingagents.agents.schemas import (
+    VIEW_FLAT_SD,
+    PortfolioDecision,
+    PortfolioRating,
+    render_pm_decision,
+)
 from tradingagents.backtest import parse_view, summarize_views
-from tradingagents.decision_log import TradingMemoryLog
+from tradingagents.memory import TradingMemoryLog
 
 
 def _decision(direction=None, days=None) -> str:

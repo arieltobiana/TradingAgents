@@ -2,7 +2,7 @@
 
 One run yields one decision, so it cannot say whether the system decides well.
 This runs the same machinery over many (ticker, date) cells and reads the
-aggregate. The decision log is the results table: every run already records its
+aggregate. The memory log is the results table: every run already records its
 rating and later settles it with realized and alpha return against the
 instrument's regional benchmark, so there is nothing to record separately.
 
@@ -16,22 +16,29 @@ cell rather than a position carried forward.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from tradingagents.agents.rating import RATING_REVIEW
-from tradingagents.agents.schemas import VIEW_DIRECTIONS, VIEW_FLAT_SD, VIEW_MAX_DAYS, VIEW_VOL_WINDOW
+from tradingagents.agents.schemas import (
+    VIEW_DIRECTIONS,
+    VIEW_FLAT_SD,
+    VIEW_MAX_DAYS,
+    VIEW_VOL_WINDOW,
+)
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.dataflows.vendors.yahoo.market import get_closes
-from tradingagents.decision_log import TradingMemoryLog
 from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.graph.settlement import fetch_returns, resolve_benchmark
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.memory import TradingMemoryLog
+from tradingagents.memory.settlement import fetch_returns, resolve_benchmark
 
 logger = logging.getLogger(__name__)
 
@@ -124,11 +131,24 @@ class BacktestSummary:
         if self.pending:
             lines.append("Pending cells are not scored above; re-run to settle them.")
         lines.append(
-            f"Alpha is measured over {self.holding} after each analysis date. "
+            f"Alpha is measured over {self.holding} from the first close after each analysis date. "
             "One model sampling per cell, and text feeds are not archived, so "
             "these figures are indicative rather than repeatable."
         )
         return "\n".join(lines)
+
+
+def _new_run(runs: Path) -> str:
+    """A new run's id, stamped now, and its directory, claimed so no other sweep shares it."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    runs.mkdir(parents=True, exist_ok=True)
+    for n in itertools.count(1):
+        run_id = stamp if n == 1 else f"{stamp}_{n}"
+        try:
+            (runs / run_id).mkdir()
+            return run_id
+        except FileExistsError:
+            continue
 
 
 def run_backtest(
@@ -139,18 +159,24 @@ def run_backtest(
     portfolio=None,
     selected_analysts=("market", "social", "news", "fundamentals"),
     run_id: str | None = None,
+    progress: Callable[[int, int, str, str], None] | None = None,
 ) -> BacktestResult:
-    """Analyze every ticker on every date, into a decision log of this run's own.
+    """Analyze every ticker on every date, into a memory log of this run's own.
 
     The live log stays untouched: a sweep would otherwise flood the context that
     real runs read back. Cells already in this run's log are skipped, so an
-    interrupted sweep resumes by being run again.
+    interrupted sweep resumes by being run again. ``progress(done, total,
+    ticker, date)`` is called before each cell that runs.
     """
-    # run_id becomes a path segment, so it is validated like a ticker: an
-    # absolute or dotted value would otherwise place the run outside results_dir.
-    run_id = safe_ticker_component(run_id or datetime.now().strftime("%Y%m%d_%H%M%S"))
-    run_dir = Path(config["results_dir"]) / "backtest" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    runs = Path(config["results_dir"]) / "backtest"
+    if run_id:
+        # run_id becomes a path segment, so it is validated like a ticker: an
+        # absolute or dotted value would otherwise place the run outside results_dir.
+        run_id = safe_ticker_component(run_id)
+        (runs / run_id).mkdir(parents=True, exist_ok=True)
+    else:
+        run_id = _new_run(runs)
+    run_dir = runs / run_id
     run_config = {**config, "results_dir": str(run_dir),
                   "memory_log_path": str(run_dir / "trading_memory.md")}
 
@@ -158,23 +184,30 @@ def run_backtest(
     result = BacktestResult(run_id=run_id, log_path=Path(run_config["memory_log_path"]))
     done = {(e["ticker"], e["date"]) for e in graph.memory_log.load_entries()}
 
-    for ticker in tickers:
-        for date in dates:
-            if (ticker, date) in done:
-                result.skipped += 1
-                continue
-            try:
-                graph.propagate(ticker, date, asset_type, portfolio=portfolio)
-                result.cells_run += 1
-            except Exception as exc:  # one unreachable vendor must not end the sweep
-                logger.warning("Backtest cell %s %s failed: %s", ticker, date, exc)
-                result.failures.append((ticker, date, str(exc)))
+    # A ticker or date given twice is one cell, run and settled once.
+    tickers, dates = list(dict.fromkeys(tickers)), list(dict.fromkeys(dates))
+    cells = [(ticker, date) for ticker in tickers for date in dates]
+    todo = [cell for cell in cells if cell not in done]
+    result.skipped = len(cells) - len(todo)
+    for index, (ticker, date) in enumerate(todo, 1):
+        if progress:
+            progress(index, len(todo), ticker, date)
+        try:
+            graph.propagate(ticker, date, asset_type, portfolio=portfolio)
+            result.cells_run += 1
+        except Exception as exc:  # one unreachable vendor must not end the sweep
+            logger.warning("Backtest cell %s %s failed: %s", ticker, date, exc)
+            result.failures.append((ticker, date, str(exc)))
 
     # Settlement runs at the start of the next run for a ticker, so each ticker's
     # last cell would stay pending without this pass.
     for ticker in tickers:
         try:
-            graph.settle_pending(ticker)
+            settlement = graph.settle_pending(ticker)
+            result.settlement_failures.extend(
+                (failed_ticker, f"{date}: {reason}")
+                for failed_ticker, date, reason in settlement.failed
+            )
         except Exception as exc:  # reflection calls an LLM; one failure is not the sweep's
             logger.warning("Settling %s failed: %s", ticker, exc)
             result.settlement_failures.append((ticker, str(exc)))
@@ -190,12 +223,12 @@ def _log_entries(source) -> list[dict]:
     elif Path(source).is_file():
         path = Path(source)
     else:
-        raise FileNotFoundError(f"no decision log at {source}")
+        raise FileNotFoundError(f"no memory log at {source}")
     return TradingMemoryLog({"memory_log_path": str(path)}).load_entries()
 
 
 def summarize(source: BacktestResult | str | Path) -> BacktestSummary:
-    """Score the settled decisions of a backtest, or of a decision log at a path, by rating."""
+    """Score the settled decisions of a backtest, or of a memory log at a path, by rating."""
     entries = _log_entries(source)
     # A decision with no readable rating has no direction, so it can neither
     # count for nor against the system; it is reported as unscored instead.
@@ -361,8 +394,12 @@ def summarize_views(source, config: dict | None = None) -> ViewSummary:
             continue
         direction, days = view
         ticker = entry["ticker"]
-        raw, alpha, _, _ = fetch_returns(ticker, entry["date"], holding_days=days,
-                                         benchmark=resolve_benchmark(ticker, config))
+        try:
+            raw, alpha, _, _ = fetch_returns(ticker, entry["date"], holding_days=days,
+                                             benchmark=resolve_benchmark(ticker, config))
+        except Exception as exc:  # fetch_returns raises when prices cannot be read
+            logger.warning("No view outcome for %s on %s: %s", ticker, entry["date"], exc)
+            raw = None
         if raw is None:
             pending += 1  # the horizon has not traded yet, or prices are unreachable
             continue

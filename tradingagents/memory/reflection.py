@@ -1,3 +1,5 @@
+"""Reflection: a settled decision's outcome turned into a short lesson for later runs."""
+
 from typing import Any
 
 
@@ -9,7 +11,7 @@ class Reflector:
         self.quick_thinking_llm = quick_thinking_llm
 
     def _system_prompt(self, holding_days: int) -> str:
-        """Concise prompt for reflect_on_final_decision (Phase B log entries).
+        """Concise prompt for reflect_on_final_decision (settled memory log entries).
 
         Produces 2-4 sentences of plain prose, compact enough to be re-injected
         into future agent prompts without bloating the context window. The
@@ -19,7 +21,7 @@ class Reflector:
         """
         return (
             "You are a trading analyst reviewing your own past decision now that the outcome is known.\n"
-            f"The outcome covers {holding_days} trading days after the analysis date, "
+            f"The outcome covers {holding_days} trading days from the first close after the analysis date, "
             "which may be shorter than the horizon the decision was written for.\n"
             "Write exactly 2-4 sentences of plain prose (no bullets, no headers, no markdown).\n\n"
             "Cover in order:\n"
@@ -27,7 +29,7 @@ class Reflector:
             "and say so plainly if the window is too short to judge the thesis.\n"
             "2. Which part of the investment thesis this window supports or undercuts.\n"
             "3. One concrete lesson to apply to the next similar analysis.\n\n"
-            "Be specific and terse. Your output will be stored verbatim in a decision log "
+            "Be specific and terse. Your output will be stored verbatim in a memory log "
             "and re-read by future analysts, so every word must earn its place."
         )
 
@@ -41,7 +43,7 @@ class Reflector:
     ) -> str:
         """Single reflection call on the final trade decision with outcome context.
 
-        Used by Phase B deferred reflection. The final_trade_decision already
+        Used when a pending decision is settled. The final_trade_decision already
         synthesises all analyst insights, so no separate market context is needed.
         ``benchmark_name`` is the label used for the alpha line (e.g. ``"SPY"``
         for US tickers, ``"^N225"`` for ``.T`` listings); defaults to SPY for

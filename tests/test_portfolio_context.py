@@ -46,6 +46,20 @@ def test_a_ticker_held_under_another_spelling_is_matched():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("held, analyzed, canonical", [
+    ("BTCUSDT", "BTC-USD", "BTC-USD"),
+    ("XAUUSD+", "GC=F", "GC=F"),
+    ("700.HK", "0700.HK", "0700.HK"),
+    ("0700.HK", "700.HK", "0700.HK"),
+])
+def test_a_holding_under_a_broker_alias_is_the_analyzed_instrument(held, analyzed, canonical):
+    book = PortfolioContext.model_validate({"positions": [{"ticker": held, "quantity": 2}, {"ticker": "ethusdt", "quantity": 1}]})
+    text = book.render(analyzed)
+    assert f"Current position in {canonical}: 2 units" in text
+    assert "Other positions: ETHUSDT 1" in text   # as listed
+
+
+@pytest.mark.unit
 def test_absent_context_is_reported_as_not_provided():
     notice = get_portfolio_context_from_state({"company_of_interest": "AAPL"})
     assert "not provided" in notice.lower()
@@ -67,6 +81,36 @@ def test_load_rejects_a_malformed_file_with_a_clear_error(tmp_path):
 
 
 @pytest.mark.unit
+def test_one_instrument_held_under_two_spellings_shows_both_holdings():
+    book = PortfolioContext.model_validate({"positions": [
+        {"ticker": "BTCUSDT", "quantity": 1}, {"ticker": "BTC-USD", "quantity": 2}]})
+    text = book.render("BTC-USD")
+    assert "Current position in BTC-USD: 1 units (listed as BTCUSDT)" in text
+    assert "Current position in BTC-USD: 2 units" in text and "Other positions" not in text
+
+
+@pytest.mark.unit
+def test_a_holding_keeps_the_instrument_it_was_listed_as():
+    # WTI is also an alias of crude oil futures; listed beside AAPL it is the stock as written.
+    text = PortfolioContext.model_validate({"positions": [{"ticker": "WTI", "quantity": 100}]}).render("AAPL")
+    assert "Other positions: WTI 100" in text and "CL=F" not in text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("book", [
+    '{"cash": NaN}',
+    '{"positions": [{"ticker": "AAPL", "quantity": Infinity}]}',
+    '{"positions": [{"ticker": "AAPL", "quantity": 1, "average_price": "nan"}]}',
+])
+def test_load_rejects_a_number_that_is_not_finite(tmp_path, book):
+    # Python's json writes NaN and Infinity, and they would reach the agents as "nan units".
+    bad = tmp_path / "p.json"
+    bad.write_text(book)
+    with pytest.raises(ValueError, match="portfolio"):
+        load_portfolio(bad)
+
+
+@pytest.mark.unit
 def test_load_reads_a_valid_file(tmp_path):
     good = tmp_path / "p.json"
     good.write_text(json.dumps(HOLDING))
@@ -76,9 +120,9 @@ def test_load_reads_a_valid_file(tmp_path):
 # --- threading through the graph --------------------------------------------
 
 def _bare_graph(tmp_path):
-    from tradingagents.decision_log import TradingMemoryLog
     from tradingagents.graph.propagation import Propagator
     from tradingagents.graph.trading_graph import TradingAgentsGraph
+    from tradingagents.memory import TradingMemoryLog
 
     graph = object.__new__(TradingAgentsGraph)
     graph.config = {"memory_log_path": str(tmp_path / "m.md"), "max_debate_rounds": 1,
@@ -139,11 +183,11 @@ def test_decision_agents_see_the_portfolio(module, factory, monkeypatch):
         "news_report": "N", "fundamentals_report": "F", "investment_plan": "P",
         "trader_investment_plan": "T", "past_context": "",
         "portfolio_context": "PORTFOLIO_BLOCK_MARKER",
-        "investment_debate_state": {"history": "", "judge_decision": "", "count": 0},
+        "investment_debate_state": {"history": "", "count": 0},
         "risk_debate_state": {"history": "", "latest_speaker": "", "count": 0,
                               "aggressive_history": "", "conservative_history": "", "neutral_history": "",
                               "current_aggressive_response": "", "current_conservative_response": "",
-                              "current_neutral_response": "", "judge_decision": ""},
+                              "current_neutral_response": ""},
     }
     node = getattr(mod, factory)(_LLM())
     node(state)
@@ -174,9 +218,8 @@ def test_completed_run_clears_the_checkpoint_it_wrote(tmp_path, monkeypatch):
     graph.debug = False
     graph._resuming = False
     graph.propagator.get_graph_args = lambda callbacks=None: {}
-    graph.process_signal = lambda d: "Hold"
     graph._log_state = lambda *a, **k: None
-    graph.graph = type("G", (), {"invoke": lambda self, i, **k: {"final_trade_decision": "Rating: Hold\n\nx"}})()
+    graph.graph = type("G", (), {"invoke": lambda self, i, **k: {"final_trade_decision": "Rating: Hold\n\nx", "final_rating": "Hold"}})()
     book = PortfolioContext.model_validate(HOLDING)
 
     written = graph._run_signature("stock", book)  # what begin_checkpoint keys on

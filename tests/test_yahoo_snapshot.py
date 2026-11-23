@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 import tradingagents.dataflows.vendors.yahoo.snapshot as validator
+from tradingagents.dataflows.errors import NoMarketDataError
 
 
 def _sample_ohlcv() -> pd.DataFrame:
@@ -47,12 +48,12 @@ class TestVerifiedSnapshot:
 
     def test_raises_when_no_rows_on_or_before_date(self, monkeypatch):
         monkeypatch.setattr(validator, "load_ohlcv", lambda s, d, fill_gaps=True: _sample_ohlcv())
-        with pytest.raises(ValueError):
+        with pytest.raises(NoMarketDataError):
             validator.build_verified_market_snapshot("COF", "2020-01-01")
 
     def test_raises_on_empty_data(self, monkeypatch):
         monkeypatch.setattr(validator, "load_ohlcv", lambda s, d, fill_gaps=True: pd.DataFrame())
-        with pytest.raises(ValueError):
+        with pytest.raises(NoMarketDataError):
             validator.build_verified_market_snapshot("COF", "2026-05-13")
 
     def test_look_back_window_capped_at_30(self, monkeypatch):
@@ -72,3 +73,47 @@ class TestTool:
             {"symbol": "COF", "curr_date": "2026-05-20"}
         )
         assert "Verified market data snapshot for COF" in out
+
+
+@pytest.mark.unit
+class TestPricesKeepTheirDigits:
+    """A price prints with its significant digits: a sub-cent coin is not 0.00, a rate keeps its pips."""
+
+    @pytest.mark.parametrize("value, text", [
+        (0.00000503123456, "0.00000503123"),
+        (1.123456, "1.12346"),
+        (763.960022, "763.96"),
+        (81074.1875, "81074.19"),
+        (100.0, "100.00"),
+        (-0.0012345678, "-0.00123457"),
+        (0.0, "0.00"),
+    ])
+    def test_price_text(self, value, text):
+        from tradingagents.dataflows.vendors.yahoo.common import price_text
+        assert price_text(value) == text
+
+    def test_the_snapshot_shows_a_sub_cent_close(self, monkeypatch):
+        data = _sample_ohlcv()
+        for col in ("Open", "High", "Low", "Close"):
+            data[col] = data[col] * 0.0000001
+        monkeypatch.setattr(validator, "load_ohlcv", lambda s, d, fill_gaps=True: data)
+        text = validator.build_verified_market_snapshot("SHIB-USD", "2026-05-20")
+        assert "| Close | 0.0000135 |" in text and "| Close | 0.00 |" not in text
+
+    def test_the_price_table_shows_a_sub_cent_close(self, monkeypatch):
+        from tradingagents.dataflows.vendors.yahoo import market
+
+        days = pd.bdate_range("2026-05-11", "2026-05-15")
+        frame = pd.DataFrame({"Open": 0.00000501, "High": 0.00000512, "Low": 0.00000499,
+                              "Close": 0.00000503, "Volume": 10**9}, index=days)
+
+        class _Ticker:
+            def __init__(self, symbol):
+                pass
+
+            def history(self, **kwargs):
+                return frame
+
+        monkeypatch.setattr(market.yf, "Ticker", _Ticker)
+        text = market.get_YFin_data_online("SHIB-USD", "2026-05-11", "2026-05-15")
+        assert "0.00000503" in text and ",0.0," not in text

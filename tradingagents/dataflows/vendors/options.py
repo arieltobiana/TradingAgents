@@ -209,13 +209,33 @@ def fetch_alpaca(symbol: str, symbols: list[str] | None = None) -> list[Quote]:
     return quotes
 
 
+#: Set by the first 403 from Cboe in this process. Cloudflare in front of Cboe's CDN refuses
+#: this machine outright (since 2026-11-20), so every later symbol would get the same answer
+#: and log the same line: one line per run says it, the rest go straight to Alpaca. Any
+#: other failure (timeout, 5xx, bad JSON) is per symbol and still tried each time.
+_cboe_refused: str | None = None
+
+
+def _is_refusal(exc: Exception) -> bool:
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) == 403
+
+
 def fetch_chain(symbol: str) -> tuple[dict, list[Quote]]:
     """The whole chain from Cboe, or from Alpaca when Cboe fails; ``meta["feed"]`` names the kind."""
+    global _cboe_refused
     try:
+        if _cboe_refused:
+            raise RuntimeError(_cboe_refused)
         meta, chain = fetch_cboe(symbol)
         meta.setdefault("feed", "delayed")
     except Exception as exc:  # noqa: BLE001 — fall back to the second source
-        logger.warning("options: Cboe unavailable for %s (%s); trying Alpaca", symbol, exc)
+        if _cboe_refused is None:
+            if _is_refusal(exc):
+                _cboe_refused = f"Cboe refused this machine (403) at {symbol}"
+                logger.warning("options: %s; using Alpaca for the rest of this run", _cboe_refused)
+            else:
+                logger.warning("options: Cboe unavailable for %s (%s); trying Alpaca", symbol, exc)
         chain = fetch_alpaca(symbol)
         meta = {"source": "Alpaca indicative feed", "as_of": datetime.now(NY).isoformat(timespec="minutes"),
                 "spot": None, "iv30": None, "session": None, "feed": "indicative"}
